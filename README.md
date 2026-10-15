@@ -1,8 +1,8 @@
 # PainelCli
 
-PainelCli is an experimental native macOS AppKit app for keeping a local list of Codex CLI, Claude Code, and Gemini CLI registrations. Registrations are separate from installation state. The app supports duplicate registrations, removes one selected record at a time, and assigns stable per-provider numbers.
+PainelCli is an experimental native macOS AppKit app that discovers selected Codex CLI, Claude Code, and Gemini CLI executables and keeps a local list of manual registrations. Discovery checks the running app's `PATH`, common macOS and user locations, the ChatGPT-bundled Codex path, and PainelCli's managed installation prefix. It inspects executable files without running them and is not a universal inventory. Automatic rows are reconciled across refreshes, manual registrations remain distinct, and removing an automatic row persistently hides that detected path without uninstalling it. An explicit catalog add can reuse an automatic row. The app supports duplicate manual registrations, removes one selected record at a time, and assigns stable per-provider numbers.
 
-**Status: development. No production version has been approved.** Version 0.0.0.12 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
+**Status: development. No production version has been approved.** Version 0.0.0.16 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
 
 ## Build and test
 
@@ -20,7 +20,7 @@ Gemini CLI's upstream project announced that individual free, Google AI Pro, and
 
 - `develop`: active development; the repository's default branch.
 - `main`: production policy and approved production source only. It currently contains no approved app version.
-- Promote with a pull request from `develop` after CI passes and João explicitly accepts the app's functionality. No stable release, tag, or deployment is created automatically. Branch rules protect `main` from deletion and force-push and require CI and a pull request; they do not require another person to approve an owner-operated change.
+- Promote with a pull request from `develop` after CI passes and the project owner explicitly accepts the app's functionality. No stable release, tag, or deployment is created automatically. Branch rules protect `main` from deletion and force-push and require CI and a pull request; they do not require another person to approve an owner-operated change.
 
 Provider names are used only to identify integrations. See [TRADEMARKS.md](TRADEMARKS.md). Third-party logos are not included in the public repository or app bundle. Apache-2.0 applies to the repository's code and does not grant rights to third-party names or marks.
 

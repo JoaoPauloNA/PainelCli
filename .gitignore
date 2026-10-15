@@ -16,5 +16,6 @@ cli-entries.json
 .npmrc
 npm-cache/
 /DadosTeste/
+/output/
 /Resources/*
 !/Resources/AppIcon.icns

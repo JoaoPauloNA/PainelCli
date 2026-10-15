@@ -64,22 +64,37 @@ enum CLIInstallError: Error {
     case commandFailed
 }
 
+struct CLIDetection: Equatable {
+    let provider: CLIProvider
+    let executableURL: URL
+    let isManaged: Bool
+}
+
 struct CLIInstallService {
     private let fileManager: FileManager
     private let supportDirectory: URL
     private let runner: CLICommandRunning
     private let environment: [String: String]
+    private let homeDirectory: URL
+    private let additionalSearchDirectories: [URL]?
+    private let knownExecutableOverrides: [CLIProvider: [URL]]?
 
     init(applicationSupportDirectory: URL,
          fileManager: FileManager = .default,
          runner: CLICommandRunning = FoundationCLICommandRunner(),
-         environment: [String: String] = ProcessInfo.processInfo.environment) {
+         environment: [String: String] = ProcessInfo.processInfo.environment,
+         homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true),
+         additionalSearchDirectories: [URL]? = nil,
+         knownExecutableOverrides: [CLIProvider: [URL]]? = nil) {
         self.fileManager = fileManager
         self.supportDirectory = applicationSupportDirectory
             .appendingPathComponent("PainelCli", isDirectory: true)
             .appendingPathComponent("Installations", isDirectory: true)
         self.runner = runner
         self.environment = environment
+        self.homeDirectory = homeDirectory
+        self.additionalSearchDirectories = additionalSearchDirectories
+        self.knownExecutableOverrides = knownExecutableOverrides
     }
 
     static func userService() throws -> CLIInstallService {
@@ -91,10 +106,28 @@ struct CLIInstallService {
     }
 
     func installedExecutable(for provider: CLIProvider) -> URL? {
+        detectedExecutables(for: provider).first?.executableURL
+    }
+
+    func detectedExecutables() -> [CLIDetection] {
+        CLIProvider.allCases.flatMap(detectedExecutables(for:))
+    }
+
+    func detectedExecutables(for provider: CLIProvider) -> [CLIDetection] {
         let managed = installDirectory(for: provider).appendingPathComponent("bin", isDirectory: true)
             .appendingPathComponent(provider.executableName, isDirectory: false)
-        if fileManager.isExecutableFile(atPath: managed.path) { return managed }
-        return discoverExecutable(named: provider.executableName)
+        var candidates = [managed]
+        candidates += searchDirectories().map { $0.appendingPathComponent(provider.executableName) }
+        candidates += knownExecutables(for: provider)
+
+        var seen = Set<String>()
+        return candidates.compactMap { candidate in
+            guard fileManager.isExecutableFile(atPath: candidate.path) else { return nil }
+            let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
+            guard seen.insert(resolved.path).inserted else { return nil }
+            let managedPath = managed.resolvingSymlinksInPath().standardizedFileURL.path
+            return CLIDetection(provider: provider, executableURL: resolved, isManaged: resolved.path == managedPath)
+        }
     }
 
     func install(provider: CLIProvider) throws {
@@ -132,6 +165,45 @@ struct CLIInstallService {
         supportDirectory.appendingPathComponent(provider.rawValue, isDirectory: true)
     }
 
+    private func knownExecutables(for provider: CLIProvider) -> [URL] {
+        if let knownExecutableOverrides { return knownExecutableOverrides[provider] ?? [] }
+        guard provider == .codex else { return [] }
+        let appRelativePath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        return [URL(fileURLWithPath: "/Applications/ChatGPT.app", isDirectory: true)
+                    .appendingPathComponent(appRelativePath),
+                homeDirectory.appendingPathComponent("Applications/ChatGPT.app", isDirectory: true)
+                    .appendingPathComponent(appRelativePath)]
+    }
+
+    private func searchDirectories() -> [URL] {
+        var directories: [URL] = []
+        if let path = environment["PATH"] {
+            directories += path.split(separator: ":").map { URL(fileURLWithPath: String($0), isDirectory: true) }
+        }
+        if let additionalSearchDirectories {
+            directories += additionalSearchDirectories
+        } else {
+            directories += [URL(fileURLWithPath: "/opt/homebrew/bin", isDirectory: true),
+                            URL(fileURLWithPath: "/usr/local/bin", isDirectory: true),
+                            URL(fileURLWithPath: "/opt/local/bin", isDirectory: true),
+                            URL(fileURLWithPath: "/usr/bin", isDirectory: true),
+                            URL(fileURLWithPath: "/bin", isDirectory: true),
+                            URL(fileURLWithPath: "/usr/sbin", isDirectory: true),
+                            URL(fileURLWithPath: "/sbin", isDirectory: true),
+                            homeDirectory.appendingPathComponent(".local/bin", isDirectory: true),
+                            homeDirectory.appendingPathComponent(".npm-global/bin", isDirectory: true),
+                            homeDirectory.appendingPathComponent("bin", isDirectory: true)]
+            let nvmDirectory = homeDirectory.appendingPathComponent(".nvm/versions/node", isDirectory: true)
+            if let versions = try? fileManager.contentsOfDirectory(at: nvmDirectory,
+                                                                   includingPropertiesForKeys: nil) {
+                directories += versions.sorted { $0.lastPathComponent > $1.lastPathComponent }
+                    .map { $0.appendingPathComponent("bin", isDirectory: true) }
+            }
+        }
+        var seen = Set<String>()
+        return directories.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
     private func sanitizedEnvironment(npmDirectory: URL, cacheDirectory: URL, userConfig: URL) -> [String: String] {
         let inheritedPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         var result = ["PATH": "\(npmDirectory.path):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -152,25 +224,7 @@ struct CLIInstallService {
     }
 
     private func discoverExecutable(named name: String) -> URL? {
-        var directories: [URL] = []
-        if let path = environment["PATH"] {
-            directories += path.split(separator: ":").map { URL(fileURLWithPath: String($0), isDirectory: true) }
-        }
-        directories += [URL(fileURLWithPath: "/opt/homebrew/bin", isDirectory: true),
-                        URL(fileURLWithPath: "/usr/local/bin", isDirectory: true),
-                        URL(fileURLWithPath: "/usr/bin", isDirectory: true),
-                        URL(fileURLWithPath: "/bin", isDirectory: true),
-                        URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-                            .appendingPathComponent(".local/bin", isDirectory: true)]
-        let nvmDirectory = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-            .appendingPathComponent(".nvm/versions/node", isDirectory: true)
-        if let versions = try? fileManager.contentsOfDirectory(at: nvmDirectory,
-                                                               includingPropertiesForKeys: nil) {
-            directories += versions.sorted { $0.lastPathComponent > $1.lastPathComponent }
-                .map { $0.appendingPathComponent("bin", isDirectory: true) }
-        }
-        var seen = Set<String>()
-        for directory in directories where seen.insert(directory.standardizedFileURL.path).inserted {
+        for directory in searchDirectories() {
             let candidate = directory.appendingPathComponent(name, isDirectory: false)
             if fileManager.isExecutableFile(atPath: candidate.path) { return candidate }
         }

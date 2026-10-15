@@ -60,9 +60,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var entryStore: CLIEntryStore?
     private var installService: CLIInstallService?
     private var entries: [CLIEntry] = []
+    private var detections: [CLIDetection] = []
     private var storageLoadFailed = false
     private var installingProviders = Set<String>()
     private var installMessages: [String: String] = [:]
+    // Explicitly authorized UI demo only. Never persisted or used as authentication evidence.
+    private var simulatedSessions = Set<UUID>()
 
     private func navigationButton(_ title: String, symbol: String, action: Selector,
                                   selected: Bool) -> NSButton {
@@ -88,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             entryStore = store
             entries = try store.load()
             installService = try CLIInstallService.userService()
+            refreshCLIEntries()
         } catch {
             storageLoadFailed = true
         }
@@ -263,7 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 12
+        stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
         scrollView.documentView = document
@@ -291,53 +295,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             notice.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         } else {
             for (index, entry) in entries.enumerated() {
-                let row = Surface(.controlBackgroundColor, radius: 12)
-                row.heightAnchor.constraint(equalToConstant: 132).isActive = true
+                let row = NSView()
+                row.translatesAutoresizingMaskIntoConstraints = false
+                row.heightAnchor.constraint(equalToConstant: 56).isActive = true
                 let icon = NSImageView()
                 icon.image = cliSymbol()
                 icon.imageScaling = .scaleProportionallyUpOrDown
-                icon.contentTintColor = .labelColor
+                icon.contentTintColor = .secondaryLabelColor
                 icon.setAccessibilityElement(false)
-                icon.translatesAutoresizingMaskIntoConstraints = false
-                let name = label(entry.displayName, size: 14, weight: .semibold)
+                let name = label(entry.displayName, size: 13, weight: .medium)
                 let statusText = entryStatus(for: entry)
-                let status = label(statusText, size: 12, color: .secondaryLabelColor)
-                status.lineBreakMode = .byTruncatingMiddle
+                let compactStatus: String
+                if statusText.hasPrefix("Encontrada") {
+                    compactStatus = entry.provider == "GeminiCLI" ? "Encontrada · contas individuais indisponíveis" : "Encontrada no sistema"
+                } else if statusText.hasPrefix("Instalada") {
+                    compactStatus = entry.provider == "GeminiCLI" ? "Instalada · contas individuais indisponíveis" : "Instalada pelo PainelCli"
+                } else {
+                    compactStatus = statusText
+                }
+                let status = label(compactStatus, size: 11, color: .secondaryLabelColor)
+                status.lineBreakMode = .byTruncatingTail
                 status.maximumNumberOfLines = 1
                 status.toolTip = statusText
+                row.toolTip = statusText
                 status.setAccessibilityValue(statusText)
                 status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                name.lineBreakMode = .byTruncatingTail
+                name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+                let actions = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
+                                       target: self, action: #selector(removeCLI(_:)))
+                actions.bezelStyle = .inline
+                actions.isBordered = false
+                actions.contentTintColor = .systemRed
+                actions.tag = index
+                actions.isEnabled = !storageLoadFailed
+                actions.toolTip = "Remover \(entry.displayName) da lista"
+                actions.setAccessibilityLabel("Remover \(entry.displayName) da lista")
+
+                let simulatedLoggedIn = simulatedSessions.contains(entry.id)
+                let account = NSButton(image: NSImage(systemSymbolName: simulatedLoggedIn ? "power" : "person.crop.circle",
+                                                       accessibilityDescription: nil)!,
+                                       target: self, action: #selector(toggleSimulatedSession(_:)))
+                account.bezelStyle = .inline
+                account.isBordered = false
+                account.contentTintColor = simulatedLoggedIn ? .systemOrange : .systemGreen
+                account.tag = index
+                let demoAction = simulatedLoggedIn ? "Deslogar" : "Logar"
+                account.toolTip = "\(demoAction) · simulação visual, sem autenticação real"
+                account.setAccessibilityLabel("\(demoAction) de \(entry.displayName), simulação visual")
+                account.setAccessibilityValue(simulatedLoggedIn ? "Logado em simulação" : "Deslogado em simulação")
+
                 let installing = installingProviders.contains(entry.provider)
-                let install = NSButton(title: installing ? "Instalando…" : "Instalar",
-                                       target: self, action: #selector(installCLI(_:)))
-                install.bezelStyle = .rounded
-                install.tag = index
-                install.isEnabled = !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
-                install.setAccessibilityLabel("Instalar \(entry.provider)")
-                let remove = NSButton(title: "Remover", target: self, action: #selector(removeCLI(_:)))
-                remove.bezelStyle = .rounded
-                remove.tag = index
-                remove.setAccessibilityLabel("Remover \(entry.displayName) da lista")
-                [icon, name, status, install, remove].forEach {
+                let canInstall = !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
+                [icon, name, status, account, actions].forEach {
                     $0.translatesAutoresizingMaskIntoConstraints = false
                     row.addSubview($0)
                 }
+                var textTrailing = account.leadingAnchor
+                if canInstall {
+                    let install = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)!,
+                                           target: self, action: #selector(installCLI(_:)))
+                    install.bezelStyle = .inline
+                    install.isBordered = false
+                    install.tag = index
+                    install.toolTip = "Instalar \(entry.provider)"
+                    install.setAccessibilityLabel("Instalar \(entry.provider)")
+                    install.translatesAutoresizingMaskIntoConstraints = false
+                    row.addSubview(install)
+                    NSLayoutConstraint.activate([
+                        install.trailingAnchor.constraint(equalTo: account.leadingAnchor, constant: -6),
+                        install.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                        install.widthAnchor.constraint(equalToConstant: 28),
+                        install.heightAnchor.constraint(equalToConstant: 28)
+                    ])
+                    textTrailing = install.leadingAnchor
+                } else if installing {
+                    let progress = NSProgressIndicator()
+                    progress.style = .spinning
+                    progress.controlSize = .small
+                    progress.isIndeterminate = true
+                    progress.setAccessibilityLabel("Instalação em andamento")
+                    progress.translatesAutoresizingMaskIntoConstraints = false
+                    row.addSubview(progress)
+                    NSLayoutConstraint.activate([
+                        progress.trailingAnchor.constraint(equalTo: account.leadingAnchor, constant: -10),
+                        progress.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                        progress.widthAnchor.constraint(equalToConstant: 16),
+                        progress.heightAnchor.constraint(equalToConstant: 16)
+                    ])
+                    progress.startAnimation(nil)
+                    textTrailing = progress.leadingAnchor
+                }
+                let separator = NSBox()
+                separator.boxType = .separator
+                separator.translatesAutoresizingMaskIntoConstraints = false
+                row.addSubview(separator)
                 NSLayoutConstraint.activate([
-                    icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
-                    icon.topAnchor.constraint(equalTo: row.topAnchor, constant: 18),
-                    icon.widthAnchor.constraint(equalToConstant: 28),
-                    icon.heightAnchor.constraint(equalToConstant: 28),
+                    icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 4),
+                    icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    icon.widthAnchor.constraint(equalToConstant: 20),
+                    icon.heightAnchor.constraint(equalToConstant: 20),
                     name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-                    name.topAnchor.constraint(equalTo: row.topAnchor, constant: 16),
-                    name.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -16),
+                    name.topAnchor.constraint(equalTo: row.topAnchor, constant: 9),
+                    name.trailingAnchor.constraint(lessThanOrEqualTo: textTrailing, constant: -12),
                     status.leadingAnchor.constraint(equalTo: name.leadingAnchor),
-                    status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 6),
-                    status.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
-                    install.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
-                    install.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -14),
-                    install.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
-                    remove.trailingAnchor.constraint(equalTo: install.leadingAnchor, constant: -8),
-                    remove.centerYAnchor.constraint(equalTo: install.centerYAnchor)
+                    status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 3),
+                    status.trailingAnchor.constraint(equalTo: textTrailing, constant: -12),
+                    account.trailingAnchor.constraint(equalTo: actions.leadingAnchor, constant: -8),
+                    account.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    account.widthAnchor.constraint(equalToConstant: 28),
+                    account.heightAnchor.constraint(equalToConstant: 28),
+                    actions.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -2),
+                    actions.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    actions.widthAnchor.constraint(equalToConstant: 30),
+                    actions.heightAnchor.constraint(equalToConstant: 28),
+                    separator.leadingAnchor.constraint(equalTo: name.leadingAnchor),
+                    separator.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                    separator.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                    separator.heightAnchor.constraint(equalToConstant: 1)
                 ])
                 stack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -352,25 +428,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return message
         }
-        guard let provider = CLIProvider(rawValue: entry.provider), let installService else {
+        guard let provider = CLIProvider(rawValue: entry.provider) else {
             return entry.statusText
         }
-        if let executable = installService.installedExecutable(for: provider) {
-            let managed = installService.installDirectory(for: provider).appendingPathComponent("bin", isDirectory: true)
-                .appendingPathComponent(provider.executableName)
-            let detected = executable.standardizedFileURL == managed.standardizedFileURL
-                ? "Instalada pelo PainelCli" : "Encontrada no sistema · \(executable.path)"
-            return provider == .gemini ? "\(detected) · contas individuais não atendidas" : detected
+        let providerDetections = detections.filter { $0.provider == provider }
+        let detection = entry.origin == .automatic
+            ? providerDetections.first(where: { $0.executableURL.path == entry.detectedPath })
+            : providerDetections.first
+        if let detection {
+            let status: String
+            if detection.isManaged {
+                status = entry.origin == .automatic
+                    ? "Instalada pelo PainelCli · detectada automaticamente"
+                    : "Instalada pelo PainelCli · registro manual"
+            } else if entry.origin == .automatic {
+                status = "Encontrada automaticamente · \(displayLocation(detection.executableURL))"
+            } else {
+                status = "Encontrada no sistema · registro manual · \(displayLocation(detection.executableURL))"
+            }
+            return provider == .gemini ? "\(status) · contas individuais não atendidas" : status
         }
+        if entry.origin == .automatic { return "Detecção automática desatualizada" }
         if provider == .gemini { return "Registrada · serviço indisponível para contas individuais" }
         return "Registrada · CLI ainda não instalada"
     }
 
+    private func displayLocation(_ executable: URL) -> String {
+        let home = NSHomeDirectory()
+        if executable.path.hasPrefix(home + "/") {
+            return "~" + String(executable.path.dropFirst(home.count))
+        }
+        if executable.path.contains("/Applications/ChatGPT.app/") { return "ChatGPT" }
+        return executable.path
+    }
+
+    private func refreshCLIEntries() {
+        guard !storageLoadFailed, let entryStore, let installService else { return }
+        detections = installService.detectedExecutables()
+        do {
+            entries = try entryStore.reconcile(discoveries: detections)
+            simulatedSessions.formIntersection(Set(entries.map(\.id)))
+        } catch {
+            storageLoadFailed = true
+        }
+    }
+
+    @objc private func toggleSimulatedSession(_ sender: NSButton) {
+        guard entries.indices.contains(sender.tag) else { return }
+        let id = entries[sender.tag].id
+        if !simulatedSessions.insert(id).inserted {
+            simulatedSessions.remove(id)
+        }
+        render(.settings)
+    }
+
     @objc private func removeCLI(_ sender: NSButton) {
         guard !storageLoadFailed, let entryStore, entries.indices.contains(sender.tag) else { return }
-        let id = entries[sender.tag].id
+        let entry = entries[sender.tag]
+        let id = entry.id
+        let paths = detections.filter { $0.provider.rawValue == entry.provider }
+            .map { $0.executableURL.path }
         do {
-            entries = try entryStore.remove(id: id)
+            entries = try entryStore.remove(id: id, suppressingDiscoveryPaths: paths)
+            simulatedSessions.remove(id)
+            refreshCLIEntries()
             render(.settings)
         } catch {
             showStoreFailure("Não foi possível remover o registro. Os dados existentes foram preservados.")
@@ -398,7 +519,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.installingProviders.remove(providerName)
-                self.installMessages[providerName] = outcome
+                if outcome == "Instalada pelo PainelCli" || outcome.hasPrefix("Encontrada no sistema") {
+                    self.installMessages.removeValue(forKey: providerName)
+                } else {
+                    self.installMessages[providerName] = outcome
+                }
+                self.refreshCLIEntries()
                 self.render(.settings)
             }
         }
@@ -520,6 +646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let provider = CLIPackageCatalog.candidates[sender.tag]
         do {
             entries = try entryStore.add(provider: provider)
+            refreshCLIEntries()
             closeCLICatalog()
             selectedSettingsSection = .add
             render(.settings)
@@ -534,10 +661,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func showSettings() {
         selectedSettingsSection = .add
+        refreshCLIEntries()
         render(.settings)
     }
     @objc private func showAddCLICatalog() {
         selectedSettingsSection = .add
+        refreshCLIEntries()
         render(.settings)
     }
     @objc private func showCLIProxy() {
