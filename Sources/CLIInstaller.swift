@@ -67,6 +67,7 @@ enum CLIInstallError: Error {
 struct CLIDetection: Equatable {
     let provider: CLIProvider
     let executableURL: URL
+    let discoveryURL: URL
     let isManaged: Bool
 }
 
@@ -126,7 +127,9 @@ struct CLIInstallService {
             let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
             guard seen.insert(resolved.path).inserted else { return nil }
             let managedPath = managed.resolvingSymlinksInPath().standardizedFileURL.path
-            return CLIDetection(provider: provider, executableURL: resolved, isManaged: resolved.path == managedPath)
+            return CLIDetection(provider: provider, executableURL: resolved,
+                                discoveryURL: candidate.standardizedFileURL,
+                                isManaged: resolved.path == managedPath)
         }
     }
 

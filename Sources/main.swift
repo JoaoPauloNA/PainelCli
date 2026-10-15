@@ -433,7 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let providerDetections = detections.filter { $0.provider == provider }
         let detection = entry.origin == .automatic
-            ? providerDetections.first(where: { $0.executableURL.path == entry.detectedPath })
+            ? providerDetections.first(where: { $0.discoveryURL.path == entry.detectedPath })
             : providerDetections.first
         if let detection {
             let status: String
@@ -442,9 +442,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ? "Instalada pelo PainelCli · detectada automaticamente"
                     : "Instalada pelo PainelCli · registro manual"
             } else if entry.origin == .automatic {
-                status = "Encontrada automaticamente · \(displayLocation(detection.executableURL))"
+                status = "Encontrada automaticamente · \(displayLocation(detection.discoveryURL))"
             } else {
-                status = "Encontrada no sistema · registro manual · \(displayLocation(detection.executableURL))"
+                status = "Encontrada no sistema · registro manual · \(displayLocation(detection.discoveryURL))"
             }
             return provider == .gemini ? "\(status) · contas individuais não atendidas" : status
         }
@@ -487,7 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let entry = entries[sender.tag]
         let id = entry.id
         let paths = detections.filter { $0.provider.rawValue == entry.provider }
-            .map { $0.executableURL.path }
+            .map { $0.discoveryURL.path }
         do {
             entries = try entryStore.remove(id: id, suppressingDiscoveryPaths: paths)
             simulatedSessions.remove(id)

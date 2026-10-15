@@ -122,7 +122,7 @@ struct CLIEntryStore {
     func reconcile(discoveries: [CLIDetection]) throws -> [CLIEntry] {
         var document = try loadDocument()
         let original = document
-        let currentPaths = Set(discoveries.map { Self.normalizedPath($0.executableURL.path) })
+        let currentPaths = Set(discoveries.map { Self.normalizedPath($0.discoveryURL.path) })
         let manualProviders = Set(document.entries.filter { $0.origin == .manual }.map(\.provider))
 
         document.entries.removeAll { entry in
@@ -139,7 +139,7 @@ struct CLIEntryStore {
         for detection in discoveries.sorted(by: {
             ($0.provider.rawValue, $0.executableURL.path) < ($1.provider.rawValue, $1.executableURL.path)
         }) {
-            let path = Self.normalizedPath(detection.executableURL.path)
+            let path = Self.normalizedPath(detection.discoveryURL.path)
             let key = "\(detection.provider.rawValue)\u{0}\(path)"
             guard !manualProviders.contains(detection.provider.rawValue),
                   !document.hiddenDiscoveries.contains(path),
@@ -203,7 +203,7 @@ struct CLIEntryStore {
     }
 
     private static func normalizedPath(_ path: String) -> String {
-        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
     enum StoreError: Error {

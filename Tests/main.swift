@@ -139,8 +139,11 @@ func createSyntheticExecutable(_ url: URL) throws {
 
 let discoveryHome = testRoot.appendingPathComponent("discovery-home", isDirectory: true)
 let syntheticClaude = discoveryHome.appendingPathComponent(".local/bin/claude")
+let syntheticClaudeTarget = discoveryHome.appendingPathComponent(".local/share/claude/versions/2.1.test")
 let syntheticBundledCodex = testRoot.appendingPathComponent("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
-try createSyntheticExecutable(syntheticClaude)
+try createSyntheticExecutable(syntheticClaudeTarget)
+try fileManager.createDirectory(at: syntheticClaude.deletingLastPathComponent(), withIntermediateDirectories: true)
+try fileManager.createSymbolicLink(at: syntheticClaude, withDestinationURL: syntheticClaudeTarget)
 try createSyntheticExecutable(syntheticBundledCodex)
 let discoveryService = CLIInstallService(
     applicationSupportDirectory: testRoot.appendingPathComponent("discovery-support"),
@@ -152,6 +155,9 @@ let discovered = discoveryService.detectedExecutables()
 require(Set(discovered.map(\.provider)) == [.codex, .claude], "detect PATH/home and known ChatGPT executable without running it")
 require(discovered.first(where: { $0.provider == .codex })?.executableURL.path == syntheticBundledCodex.path,
         "known bundled Codex location is reported")
+require(discovered.first(where: { $0.provider == .claude })?.executableURL.path == syntheticClaudeTarget.path &&
+        discovered.first(where: { $0.provider == .claude })?.discoveryURL.path == syntheticClaude.path,
+        "symlink target is inspected while the stable user-facing path is retained")
 require(discovered.allSatisfy { !$0.isManaged }, "external discoveries remain distinct from app-managed installs")
 
 let reconciliationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("reconciliation"))
@@ -176,7 +182,10 @@ let afterManualRemoval = try reconciliationStore.remove(id: manualClaude!.id,
 require(!afterManualRemoval.contains(where: { $0.provider == CLIProvider.claude.rawValue }),
         "removing a manual record does not immediately recreate its detected row")
 let relocatedClaude = try reconciliationStore.reconcile(discoveries: [
-    CLIDetection(provider: .claude, executableURL: discoveryHome.appendingPathComponent("opt/claude"), isManaged: false)
+    CLIDetection(provider: .claude,
+                 executableURL: discoveryHome.appendingPathComponent("opt/claude"),
+                 discoveryURL: discoveryHome.appendingPathComponent("opt/claude"),
+                 isManaged: false)
 ])
 require(relocatedClaude.first(where: { $0.provider == CLIProvider.claude.rawValue })?.ordinal == 3,
         "a new path remains discoverable after the removed path was hidden")
