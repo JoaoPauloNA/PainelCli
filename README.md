@@ -2,7 +2,7 @@
 
 PainelCli is an experimental native macOS AppKit app for keeping a local list of Codex CLI, Claude Code, and Gemini CLI registrations. Registrations are separate from installation state. The app supports duplicate registrations, removes one selected record at a time, and assigns stable per-provider numbers.
 
-**Status: development. No production version has been approved.** Version 0.0.0.11 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
+**Status: development. No production version has been approved.** Version 0.0.0.12 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
 
 ## Build and test
 

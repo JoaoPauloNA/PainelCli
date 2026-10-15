@@ -36,6 +36,19 @@ private final class Surface: NSView {
     }
 }
 
+private final class TopAlignedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private func navigationMaterial() -> NSVisualEffectView {
+    let view = NSVisualEffectView()
+    view.material = .sidebar
+    view.blendingMode = .behindWindow
+    view.state = .followsWindowActiveState
+    view.translatesAutoresizingMaskIntoConstraints = false
+    return view
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var statusItem: NSStatusItem!
@@ -59,8 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.imageHugsTitle = true
         button.alignment = .left
         button.font = .systemFont(ofSize: 13, weight: selected ? .semibold : .regular)
-        button.bezelStyle = .recessed
+        button.bezelStyle = .inline
         button.setButtonType(.pushOnPushOff)
+        button.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
         button.state = selected ? .on : .off
         button.translatesAutoresizingMaskIntoConstraints = false
         button.heightAnchor.constraint(equalToConstant: 34).isActive = true
@@ -90,7 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.title = "PainelCli"
-        window.minSize = NSSize(width: 740, height: 480)
+        window.minSize = NSSize(width: 820, height: 520)
         window.isReleasedWhenClosed = false
         window.titlebarSeparatorStyle = .automatic
         window.backgroundColor = .windowBackgroundColor
@@ -122,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             sidebar.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
             sidebar.topAnchor.constraint(equalTo: rootView.topAnchor),
             sidebar.bottomAnchor.constraint(equalTo: rootView.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 196),
+            sidebar.widthAnchor.constraint(equalToConstant: 184),
             divider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             divider.widthAnchor.constraint(equalToConstant: 1),
             divider.topAnchor.constraint(equalTo: rootView.topAnchor),
@@ -179,12 +193,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func renderSettings() {
-        let navigation = Surface(.controlBackgroundColor)
+        let navigation = navigationMaterial()
         let body = NSView()
         body.translatesAutoresizingMaskIntoConstraints = false
         let divider = Surface(.separatorColor)
         [navigation, body, divider].forEach { contentView.addSubview($0) }
-        let heading = label("Configurações", size: 15, weight: .semibold)
+        let heading = label("Configurações", size: 14, weight: .semibold)
         let add = navigationButton("Adicionar", symbol: "plus.square", action: #selector(showAddCLICatalog),
                                    selected: selectedSettingsSection == .add)
         let proxy = navigationButton("CLIProxy", symbol: "network", action: #selector(showCLIProxy),
@@ -194,7 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             navigation.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             navigation.topAnchor.constraint(equalTo: contentView.topAnchor),
             navigation.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            navigation.widthAnchor.constraint(equalToConstant: 188),
+            navigation.widthAnchor.constraint(equalToConstant: 172),
             divider.leadingAnchor.constraint(equalTo: navigation.trailingAnchor),
             divider.widthAnchor.constraint(equalToConstant: 1),
             divider.topAnchor.constraint(equalTo: contentView.topAnchor),
@@ -219,36 +233,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addButton.toolTip = "Abrir catálogo de CLIs"
         addButton.setAccessibilityLabel("Abrir catálogo de CLIs")
         addButton.translatesAutoresizingMaskIntoConstraints = false
+        let title = label("Suas CLIs", size: 22, weight: .semibold)
+        body.addSubview(title)
         body.addSubview(addButton)
         NSLayoutConstraint.activate([
-            addButton.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -16),
-            addButton.topAnchor.constraint(equalTo: body.topAnchor, constant: 16),
+            title.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 24),
+            title.topAnchor.constraint(equalTo: body.topAnchor, constant: 24),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -16),
+            addButton.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -24),
+            addButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             addButton.widthAnchor.constraint(equalToConstant: 36),
             addButton.heightAnchor.constraint(equalToConstant: 32)
         ])
         renderEntryList(in: body)
     }
 
+    private func cliSymbol() -> NSImage? {
+        NSImage(systemSymbolName: "terminal", accessibilityDescription: "CLI")
+    }
+
     private func renderEntryList(in body: NSView) {
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
-        let document = NSView()
+        let document = TopAlignedDocumentView()
         document.translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
         scrollView.documentView = document
         body.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 16),
-            scrollView.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -16),
-            scrollView.topAnchor.constraint(equalTo: body.topAnchor, constant: 60),
-            scrollView.bottomAnchor.constraint(equalTo: body.bottomAnchor, constant: -16),
+            scrollView.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 24),
+            scrollView.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -24),
+            scrollView.topAnchor.constraint(equalTo: body.topAnchor, constant: 76),
+            scrollView.bottomAnchor.constraint(equalTo: body.bottomAnchor, constant: -24),
             document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
@@ -256,46 +280,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.bottomAnchor.constraint(equalTo: document.bottomAnchor)
         ])
 
-        if storageLoadFailed {
-            stack.addArrangedSubview(label("Não foi possível carregar os registros salvos. O arquivo foi preservado e novos registros estão indisponíveis."))
-        } else if entries.isEmpty {
-            stack.addArrangedSubview(label("Nenhuma CLI adicionada."))
+        if storageLoadFailed || entries.isEmpty {
+            let message = storageLoadFailed
+                ? "Não foi possível carregar os registros salvos. O arquivo foi preservado e novos registros estão indisponíveis."
+                : "Nenhuma CLI adicionada. Use + para escolher no catálogo."
+            let notice = NSTextField(wrappingLabelWithString: message)
+            notice.font = .systemFont(ofSize: 13)
+            notice.textColor = .secondaryLabelColor
+            stack.addArrangedSubview(notice)
+            notice.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         } else {
-            for entry in entries {
-                let row = Surface(.quaternaryLabelColor.withAlphaComponent(0.07), radius: 10)
-                row.heightAnchor.constraint(equalToConstant: 72).isActive = true
+            for (index, entry) in entries.enumerated() {
+                let row = Surface(.controlBackgroundColor, radius: 12)
+                row.heightAnchor.constraint(equalToConstant: 132).isActive = true
+                let icon = NSImageView()
+                icon.image = cliSymbol()
+                icon.imageScaling = .scaleProportionallyUpOrDown
+                icon.contentTintColor = .labelColor
+                icon.setAccessibilityElement(false)
+                icon.translatesAutoresizingMaskIntoConstraints = false
                 let name = label(entry.displayName, size: 14, weight: .semibold)
                 let statusText = entryStatus(for: entry)
                 let status = label(statusText, size: 12, color: .secondaryLabelColor)
-                row.addSubview(name)
-                row.addSubview(status)
+                status.lineBreakMode = .byTruncatingMiddle
+                status.maximumNumberOfLines = 1
+                status.toolTip = statusText
+                status.setAccessibilityValue(statusText)
+                status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
                 let installing = installingProviders.contains(entry.provider)
                 let install = NSButton(title: installing ? "Instalando…" : "Instalar",
                                        target: self, action: #selector(installCLI(_:)))
                 install.bezelStyle = .rounded
-                install.tag = entries.firstIndex(where: { $0.id == entry.id }) ?? 0
+                install.tag = index
                 install.isEnabled = !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
                 install.setAccessibilityLabel("Instalar \(entry.provider)")
                 let remove = NSButton(title: "Remover", target: self, action: #selector(removeCLI(_:)))
                 remove.bezelStyle = .rounded
-                remove.tag = install.tag
+                remove.tag = index
                 remove.setAccessibilityLabel("Remover \(entry.displayName) da lista")
-                [install, remove].forEach {
+                [icon, name, status, install, remove].forEach {
                     $0.translatesAutoresizingMaskIntoConstraints = false
                     row.addSubview($0)
                 }
                 NSLayoutConstraint.activate([
-                    name.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
-                    name.topAnchor.constraint(equalTo: row.topAnchor, constant: 13),
-                    name.trailingAnchor.constraint(lessThanOrEqualTo: install.leadingAnchor, constant: -12),
+                    icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
+                    icon.topAnchor.constraint(equalTo: row.topAnchor, constant: 18),
+                    icon.widthAnchor.constraint(equalToConstant: 28),
+                    icon.heightAnchor.constraint(equalToConstant: 28),
+                    name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+                    name.topAnchor.constraint(equalTo: row.topAnchor, constant: 16),
+                    name.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -16),
                     status.leadingAnchor.constraint(equalTo: name.leadingAnchor),
-                    status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 4),
-                    status.trailingAnchor.constraint(lessThanOrEqualTo: install.leadingAnchor, constant: -12),
-                    install.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
-                    install.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                    install.widthAnchor.constraint(greaterThanOrEqualToConstant: 82),
+                    status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 6),
+                    status.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
+                    install.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -16),
+                    install.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -14),
+                    install.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
                     remove.trailingAnchor.constraint(equalTo: install.leadingAnchor, constant: -8),
-                    remove.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+                    remove.centerYAnchor.constraint(equalTo: install.centerYAnchor)
                 ])
                 stack.addArrangedSubview(row)
                 row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -376,19 +418,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let nameLabel = label(name, size: 14, weight: .semibold)
         let maker = label(name == "CodexCLI" ? "OpenAI" : name == "ClaudeCLI" ? "Anthropic" : "Google",
                           size: 12, color: .secondaryLabelColor)
+        let icon = NSImageView()
+        icon.image = cliSymbol()
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.contentTintColor = .labelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.setAccessibilityElement(false)
+        row.addSubview(icon)
         row.addSubview(nameLabel)
         row.addSubview(maker)
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 66),
-            nameLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
-            nameLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 13),
+            row.heightAnchor.constraint(equalToConstant: 72),
+            icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 16),
+            icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 28),
+            icon.heightAnchor.constraint(equalToConstant: 28),
+            nameLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 14),
+            nameLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 16),
             nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor, constant: -16),
             maker.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             maker.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 4)
         ])
         let selectButton = NSButton(title: "", target: self, action: #selector(selectCatalogCandidate(_:)))
         selectButton.isBordered = false
-        selectButton.tag = index
         selectButton.tag = index
         selectButton.setAccessibilityLabel("Adicionar \(name) à lista")
         selectButton.translatesAutoresizingMaskIntoConstraints = false
@@ -404,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openCLICatalog() {
         guard catalogWindow == nil else { return }
-        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 420),
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 460),
                              styleMask: [.titled], backing: .buffered, defer: false)
         panel.title = "Catálogo de CLIs"
         panel.isReleasedWhenClosed = false

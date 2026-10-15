@@ -10,7 +10,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "0.0.0.11"
+VERSION = "0.0.0.12"
 RELEASES = ROOT / "releases"
 CURRENT = RELEASES / "PainelCli.app"
 PREVIOUS = RELEASES / "PainelCli-anterior.app"
