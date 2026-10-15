@@ -5,7 +5,7 @@ This is the production branch. It currently contains governance documentation on
 Promotion requires all of the following:
 
 1. The macOS build and isolated test workflow passes for a pull request from `develop` to `main`.
-2. João explicitly accepts the app's functional behavior after user testing.
+2. The project owner explicitly accepts the app's functional behavior after user testing.
 3. The reviewed pull request is merged intentionally.
 
 No tag, release, deployment, or production promotion happens automatically. Branch rules require a pull request and CI and prevent force-push and deletion. No second-person approval is required for the sole owner.
