@@ -15,6 +15,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compile app and run isolated tests
         run: ./scripts/ci-check.sh
