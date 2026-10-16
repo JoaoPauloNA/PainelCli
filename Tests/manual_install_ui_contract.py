@@ -4,7 +4,9 @@ from pathlib import Path
 import sys
 
 
-source = (Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text(encoding="utf-8")
+root = Path(__file__).resolve().parents[1]
+source = (root / "Sources/main.swift").read_text(encoding="utf-8")
+installer = (root / "Sources/CLIInstaller.swift").read_text(encoding="utf-8")
 failures: list[str] = []
 
 status_start = source.find("private func entryStatus(for entry: CLIEntry) -> String {")
@@ -36,17 +38,24 @@ for expected, description in [
     ("entry.provider == CLIProvider.codex.rawValue", "login handler is not limited to a manual Codex registration"),
     ("service.registrationInstallStatus(for: entry) == .installed", "login can run before this UUID installation validates"),
     ("service.startAuthentication(for: entry)", "login handler does not use the isolated official CLI flow"),
-    ("service.authenticationBrowserOpened(for: entry)", "login UI does not verify that the isolated Chrome profile opened"),
+    ("service.openDeviceAuthenticationBrowser(", "login UI does not open the official device page in isolated Chrome"),
     ("process.terminate()", "login flow cannot be cancelled"),
     ("authenticationStatus(for: entry)", "successful process exit is not verified with isolated login status"),
 ]:
     if expected not in login_handler:
         failures.append(description)
 
-awaiting_browser_start = login_handler.find("self.authenticationStates[entry.id] = .awaitingBrowser")
-browser_marker_check = login_handler.find("service.authenticationBrowserOpened(for: entry)")
-if browser_marker_check < 0 or awaiting_browser_start < 0 or browser_marker_check > awaiting_browser_start:
-    failures.append("UI claims browser authentication is pending before Chrome confirms its isolated profile opened")
+awaiting_code_start = login_handler.find("self.authenticationStates[entry.id] = .awaitingUserCode(prompt.code)")
+browser_open_call = login_handler.find("service.openDeviceAuthenticationBrowser(")
+if browser_open_call < 0 or awaiting_code_start < 0 or browser_open_call > awaiting_code_start:
+    failures.append("UI displays a device code before the isolated Chrome profile is confirmed")
+
+if '["login", "--device-auth"]' not in installer:
+    failures.append("non-TTY login does not select the CLI's supported device-code mode")
+if '"--user-data-dir=\\(profile.path)"' not in installer or '"https://auth.openai.com/codex/device"' not in installer:
+    failures.append("Chrome launch is not bound to the UUID profile and fixed official device URL")
+if "session.output.fileHandleForReading" not in login_handler or "handle.availableData" not in login_handler:
+    failures.append("device-code output reader can wait for a full buffer while the CLI waits for the user")
 
 if failures:
     for failure in failures:

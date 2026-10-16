@@ -133,7 +133,7 @@ enum CLIAuthenticationUIState: Equatable {
     case checking
     case notAuthenticated
     case starting
-    case awaitingBrowser
+    case awaitingUserCode(String)
     case authenticated
     case failed(String)
     case cancelled
@@ -143,7 +143,7 @@ enum CLIAuthenticationUIState: Equatable {
         case .checking: return "Verificando login isolado…"
         case .notAuthenticated: return "Login não configurado neste cadastro"
         case .starting: return "Iniciando login isolado…"
-        case .awaitingBrowser: return "Aguardando autenticação no Chrome com perfil isolado"
+        case .awaitingUserCode(let code): return "No Chrome isolado, confirme com o código: \(code)"
         case .authenticated: return "Autenticado neste cadastro"
         case .failed(let message): return "Falha no login isolado · \(message)"
         case .cancelled: return "Login isolado cancelado"
@@ -179,16 +179,26 @@ enum CLIRegistrationInstallStatus: Equatable {
 }
 
 typealias CLICommandRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Int32
-typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Process
+typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ output: Pipe) throws -> Process
+
+struct CLIAuthenticationSession {
+    let process: Process
+    let output: Pipe
+}
+
+struct CLIDeviceCodePrompt: Equatable {
+    let verificationURL: URL
+    let code: String
+}
 
 private enum CLIProcessExecutor {
-    static func start(executable: URL, arguments: [String], environment: [String: String]) throws -> Process {
+    static func start(executable: URL, arguments: [String], environment: [String: String], output: Pipe) throws -> Process {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
+        process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         try process.run()
         return process
@@ -453,9 +463,9 @@ struct CLIInstallService {
         return .authenticated
     }
 
-    /// Starts only the official CLI's ChatGPT OAuth flow. A scoped `open` launcher routes
-    /// its browser request into a dedicated Chrome profile without changing the system default.
-    func startAuthentication(for entry: CLIEntry) throws -> Process {
+    /// Starts the official CLI's device-code login without a TTY. Captured output is parsed
+    /// in memory; only its fixed verification URL and one-time user code reach the UI.
+    func startAuthentication(for entry: CLIEntry) throws -> CLIAuthenticationSession {
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
         }
@@ -463,56 +473,72 @@ struct CLIInstallService {
         guard fileManager.fileExists(atPath: Self.chromeExecutablePath) else {
             throw CLIInstallError.chromeUnavailable
         }
-        let browserLauncher = try prepareBrowserLauncher(for: entry)
-        var isolatedEnvironment = try isolatedRuntimeEnvironment(for: entry)
-        isolatedEnvironment["PATH"] = browserLauncher.path + ":" + (isolatedEnvironment["PATH"] ?? "/usr/bin:/bin")
-
-        return try authenticationProcessLauncher(managedExecutableURL(for: entry), ["login"], isolatedEnvironment)
+        let output = Pipe()
+        let process = try authenticationProcessLauncher(managedExecutableURL(for: entry),
+                                                        ["login", "--device-auth"],
+                                                        isolatedRuntimeEnvironment(for: entry), output)
+        return CLIAuthenticationSession(process: process, output: output)
     }
 
-    func authenticationBrowserOpened(for entry: CLIEntry) -> Bool {
-        let marker = installationRoot(for: entry)
-            .appendingPathComponent("codex-home/browser-profile-opened")
-        return fileManager.fileExists(atPath: marker.path)
+    func openDeviceAuthenticationBrowser(for entry: CLIEntry, verificationURL: URL) throws -> Bool {
+        guard verificationURL.scheme == "https",
+              verificationURL.host == "auth.openai.com",
+              verificationURL.path == "/codex/device",
+              fileManager.fileExists(atPath: Self.chromeExecutablePath) else {
+            throw CLIInstallError.chromeUnavailable
+        }
+        let profile = installationRoot(for: entry).appendingPathComponent("codex-home/browser-profile", isDirectory: true)
+        try fileManager.createDirectory(at: profile, withIntermediateDirectories: true)
+        try setPrivatePermissions(profile)
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = ["-na", "/Applications/Google Chrome.app", "--args",
+                          "--user-data-dir=\(profile.path)", "--no-first-run",
+                          "--no-default-browser-check", "--new-window", verificationURL.absoluteString]
+        open.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+        open.standardInput = FileHandle.nullDevice
+        open.standardOutput = FileHandle.nullDevice
+        open.standardError = FileHandle.nullDevice
+        try open.run()
+        open.waitUntilExit()
+        guard open.terminationStatus == 0 else { return false }
+        return waitForChromeProfile(profile, timeout: 10)
     }
 
-    private func prepareBrowserLauncher(for entry: CLIEntry) throws -> URL {
-        let launcherDirectory = registrationDirectory(for: entry)
-            .appendingPathComponent("browser-launcher", isDirectory: true)
-        try fileManager.createDirectory(at: launcherDirectory, withIntermediateDirectories: true)
-        try setPrivatePermissions(launcherDirectory)
-        let launcher = launcherDirectory.appendingPathComponent("open")
-        let browserOpenedMarker = installationRoot(for: entry)
-            .appendingPathComponent("codex-home/browser-profile-opened")
-        try? fileManager.removeItem(at: browserOpenedMarker)
-        let script = #"""
-        #!/bin/sh
-        set -eu
-        url=""
-        for arg in "$@"; do
-            case "$arg" in
-                https://*)
-                    if [ -n "$url" ]; then exit 64; fi
-                    url="$arg"
-                    ;;
-            esac
-        done
-        case "$url" in
-            https://auth.openai.com/*|https://chatgpt.com/*) ;;
-            *) exit 64 ;;
-        esac
-        profile="$CODEX_HOME/browser-profile"
-        if /usr/bin/open -na "/Applications/Google Chrome.app" --args \
-            --user-data-dir="$profile" --no-first-run --no-default-browser-check --new-window "$url"; then
-            : > "$CODEX_HOME/browser-profile-opened"
-            /bin/chmod 600 "$CODEX_HOME/browser-profile-opened"
-        else
-            exit $?
-        fi
-        """#
-        try Data(script.utf8).write(to: launcher, options: .atomic)
-        try setPrivatePermissions(launcher, mode: 0o700)
-        return launcherDirectory
+    static func deviceCodePrompt(in output: String) -> CLIDeviceCodePrompt? {
+        let clean = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression)
+        let lines = clean.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard lines.contains("https://auth.openai.com/codex/device"),
+              let marker = lines.firstIndex(where: { $0.contains("Enter this one-time code") }),
+              marker + 1 < lines.count else { return nil }
+        let code = lines[(marker + 1)...].first(where: { !$0.isEmpty }) ?? ""
+        guard code.range(of: "^[A-Z0-9-]{6,24}$", options: .regularExpression) != nil,
+              let url = URL(string: "https://auth.openai.com/codex/device") else { return nil }
+        return CLIDeviceCodePrompt(verificationURL: url, code: code)
+    }
+
+    private func waitForChromeProfile(_ profile: URL, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let ps = Process()
+            let output = Pipe()
+            ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+            ps.arguments = ["-axo", "command="]
+            ps.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
+            ps.standardOutput = output
+            ps.standardError = FileHandle.nullDevice
+            ps.standardInput = FileHandle.nullDevice
+            guard (try? ps.run()) != nil else { return false }
+            let commands = output.fileHandleForReading.readDataToEndOfFile()
+            ps.waitUntilExit()
+            if ps.terminationStatus == 0,
+               let listing = String(data: commands, encoding: .utf8),
+               listing.components(separatedBy: .newlines).contains(where: {
+                   $0.contains("Google Chrome") && $0.contains("--user-data-dir=\(profile.path)")
+               }) { return true }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return false
     }
 
     /// Admin-enforced credential policies outrank the instance config. Inspect only the

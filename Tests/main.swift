@@ -230,7 +230,7 @@ let syntheticAuthService = CLIInstallService(
         authenticationStatusCommand = (executable, arguments, environment)
         return 1
     },
-    authenticationProcessLauncher: { executable, arguments, environment in
+    authenticationProcessLauncher: { executable, arguments, environment, _ in
         authenticationCommand = (executable, arguments, environment)
         return Process()
     })
@@ -239,9 +239,9 @@ require(syntheticAuthenticationStatus == .notAuthenticated,
         "isolated login status maps the synthetic nonzero command result to not authenticated")
 let fakeAuthProcess = try syntheticAuthService.startAuthentication(for: originalRegistration)
 require(authenticationStatusCommand?.1 == ["login", "status"] &&
-        authenticationCommand?.1 == ["login"] &&
+        authenticationCommand?.1 == ["login", "--device-auth"] &&
         authenticationCommand?.0 == originalInstallExecutable,
-        "status and browser login target only the Codex 0 executable with fixed arguments")
+        "status and device-code login target only the Codex 0 executable with fixed arguments")
 require(authenticationStatusCommand?.2["CODEX_HOME"] == originalInstallDirectory
             .appendingPathComponent("installation/codex-home").path &&
         authenticationCommand?.2["HOME"] == originalInstallDirectory
@@ -249,14 +249,18 @@ require(authenticationStatusCommand?.2["CODEX_HOME"] == originalInstallDirectory
         authenticationCommand?.2["OPENAI_API_KEY"] == nil &&
         authenticationCommand?.2["NPM_TOKEN"] == nil,
         "login and status inherit the instance runtime environment without host credentials")
-let browserLauncher = originalInstallDirectory.appendingPathComponent("browser-launcher/open")
-let browserLauncherText = try String(contentsOf: browserLauncher, encoding: .utf8)
-require(fileManager.isExecutableFile(atPath: browserLauncher.path) &&
-        browserLauncherText.contains("https://auth.openai.com/*") &&
-        browserLauncherText.contains("Google Chrome.app") &&
-        browserLauncherText.contains("--user-data-dir=\"$profile\"") &&
-        !browserLauncherText.contains("Safari"),
-        "the scoped launcher accepts official login origins and opens a dedicated Chrome profile")
+let devicePrompt = """
+Welcome to Codex
+1. Open this link in your browser and sign in to your account
+https://auth.openai.com/codex/device
+2. Enter this one-time code (expires in 15 minutes)
+ABCD-EFGH
+"""
+require(CLIInstallService.deviceCodePrompt(in: devicePrompt) == CLIDeviceCodePrompt(
+            verificationURL: URL(string: "https://auth.openai.com/codex/device")!, code: "ABCD-EFGH"),
+        "official device-code output is parsed in memory into the fixed URL and user code")
+require(CLIInstallService.deviceCodePrompt(in: "https://auth.openai.com/other\nEnter this one-time code\nABCD-EFGH") == nil,
+        "unapproved device URLs are never accepted from CLI output")
 _ = fakeAuthProcess
 require(CLIInstallService.authenticationPolicyAllowsFile(
             documents: ["cli_auth_credentials_store = \"file\"\nallowed_login_methods = [\"chatgpt\"]"],

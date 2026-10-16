@@ -456,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let authState = codexRegistration.map { authenticationUIState(for: $0) }
                 let canCancelLogin = codexRegistration.map {
-                    [.starting, .awaitingBrowser].contains(authenticationUIState(for: $0)) &&
+                    isAuthenticationRunningState(authenticationUIState(for: $0)) &&
                     authenticationProcesses[$0.id]?.isRunning == true
                 } ?? false
                 let canStartLogin = codexRegistration.map { canStartAuthentication(for: $0) } ?? false
@@ -592,7 +592,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               authenticationProcesses[entry.id]?.isRunning != true else { return false }
         switch authenticationUIState(for: entry) {
         case .notAuthenticated, .failed, .cancelled: return true
-        case .checking, .starting, .awaitingBrowser, .authenticated: return false
+        case .checking, .starting, .awaitingUserCode, .authenticated: return false
+        }
+    }
+
+    private func isAuthenticationRunningState(_ state: CLIAuthenticationUIState) -> Bool {
+        switch state {
+        case .starting, .awaitingUserCode: return true
+        case .checking, .notAuthenticated, .authenticated, .failed, .cancelled: return false
         }
     }
 
@@ -717,7 +724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               entry.provider == CLIProvider.codex.rawValue,
               service.registrationInstallStatus(for: entry) == .installed else { return }
 
-        if [.starting, .awaitingBrowser].contains(authenticationStates[entry.id] ?? .notAuthenticated),
+        if isAuthenticationRunningState(authenticationStates[entry.id] ?? .notAuthenticated),
            let process = authenticationProcesses[entry.id], process.isRunning {
             cancelledAuthenticationIDs.insert(entry.id)
             authenticationStates[entry.id] = .cancelled
@@ -732,33 +739,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let process = try service.startAuthentication(for: entry)
+                let session = try service.startAuthentication(for: entry)
+                let process = session.process
                 DispatchQueue.main.async {
                     guard let self else { process.terminate(); return }
                     self.authenticationProcesses[entry.id] = process
                     self.authenticationStates[entry.id] = .starting
                     if self.settingsButton.state == .on { self.render(.settings) }
                 }
+                let promptLock = NSLock()
                 var browserOpened = false
-                for _ in 0..<300 {
-                    guard process.isRunning else { break }
-                    if service.authenticationBrowserOpened(for: entry) {
-                        browserOpened = true
-                        break
+                let readerFinished = DispatchGroup()
+                readerFinished.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    defer { readerFinished.leave() }
+                    var buffered = Data()
+                    let handle = session.output.fileHandleForReading
+                    while true {
+                        let chunk = handle.availableData
+                        guard !chunk.isEmpty else { break }
+                        buffered.append(chunk)
+                        if buffered.count > 8192 { buffered = Data(buffered.suffix(8192)) }
+                        guard let text = String(data: buffered, encoding: .utf8),
+                              let prompt = CLIInstallService.deviceCodePrompt(in: text) else { continue }
+                        promptLock.lock()
+                        let alreadyOpened = browserOpened
+                        promptLock.unlock()
+                        guard !alreadyOpened else { continue }
+                        let opened = (try? service.openDeviceAuthenticationBrowser(
+                            for: entry, verificationURL: prompt.verificationURL)) == true
+                        promptLock.lock()
+                        browserOpened = opened
+                        promptLock.unlock()
+                        DispatchQueue.main.async {
+                            guard let self,
+                                  self.cancelledAuthenticationIDs.contains(entry.id) == false else { return }
+                            if opened {
+                                self.authenticationStates[entry.id] = .awaitingUserCode(prompt.code)
+                            } else {
+                                self.authenticationStates[entry.id] = .failed("O Chrome não confirmou o perfil isolado; o login foi interrompido.")
+                                if process.isRunning { process.terminate() }
+                            }
+                            if self.settingsButton.state == .on { self.render(.settings) }
+                        }
                     }
-                    Thread.sleep(forTimeInterval: 0.1)
-                }
-                if browserOpened {
-                    DispatchQueue.main.async {
-                        guard let self,
-                              self.cancelledAuthenticationIDs.contains(entry.id) == false else { return }
-                        self.authenticationStates[entry.id] = .awaitingBrowser
-                        if self.settingsButton.state == .on { self.render(.settings) }
-                    }
-                } else if process.isRunning {
-                    process.terminate()
                 }
                 process.waitUntilExit()
+                readerFinished.wait()
+                promptLock.lock()
+                let confirmedBrowser = browserOpened
+                promptLock.unlock()
                 let authenticated = (try? service.authenticationStatus(for: entry)) == .authenticated
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -767,12 +797,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.authenticationStates[entry.id] = .authenticated
                     } else if self.cancelledAuthenticationIDs.remove(entry.id) != nil {
                         self.authenticationStates[entry.id] = .cancelled
-                    } else if !browserOpened {
-                        self.authenticationStates[entry.id] = .failed("O CLI não confirmou que abriu o Chrome isolado; o login foi interrompido.")
+                    } else if !confirmedBrowser {
+                        self.authenticationStates[entry.id] = .failed("A CLI não disponibilizou um código de acesso para abrir no Chrome isolado.")
                     } else if process.terminationStatus == 0 {
                         self.authenticationStates[entry.id] = .failed("A CLI encerrou sem confirmar a autenticação.")
                     } else {
-                        self.authenticationStates[entry.id] = .failed("O fluxo oficial terminou sem autenticação confirmada.")
+                        self.authenticationStates[entry.id] = .failed("O código expirou ou o fluxo oficial terminou sem autenticação confirmada.")
                     }
                     if self.settingsButton.state == .on { self.render(.settings) }
                 }
