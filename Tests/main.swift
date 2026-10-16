@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() { fatalError(message) }
@@ -238,6 +239,16 @@ let syntheticAuthenticationStatus = try syntheticAuthService.authenticationStatu
 require(syntheticAuthenticationStatus == .notAuthenticated,
         "isolated login status maps the synthetic nonzero command result to not authenticated")
 let fakeAuthProcess = try syntheticAuthService.startAuthentication(for: originalRegistration)
+var deletionDuringAuthenticationWasCalled = false
+do {
+    try codexInstallService.removeRegistration(entry: originalRegistration) {
+        deletionDuringAuthenticationWasCalled = true
+    }
+    fatalError("active authentication lease must block trash")
+} catch CLIInstallError.installationInProgress {
+}
+require(!deletionDuringAuthenticationWasCalled,
+        "the active app-server login lease blocks UUID deletion")
 require(authenticationStatusCommand?.1 == ["login", "status"] &&
         authenticationCommand?.1 == ["app-server", "--stdio"] &&
         authenticationCommand?.0 == originalInstallExecutable,
@@ -249,6 +260,7 @@ require(authenticationStatusCommand?.2["CODEX_HOME"] == originalInstallDirectory
         authenticationCommand?.2["OPENAI_API_KEY"] == nil &&
         authenticationCommand?.2["NPM_TOKEN"] == nil,
         "browser login and status inherit the instance runtime environment without host credentials")
+fakeAuthProcess.releaseOperationLock()
 let browserLoginRequest = CLIAppServerLoginProtocol.startRequest()
 let browserLoginObject = try JSONSerialization.jsonObject(with: browserLoginRequest!.dropLast()) as! [String: Any]
 require((browserLoginObject["params"] as? [String: String])?["type"] == "chatgpt",
@@ -403,16 +415,21 @@ require(codexInstallService.registrationInstallStatus(for: originalRegistration)
         "reinstall restores the same UUID package while retaining its local data")
 try codexInstallService.uninstall(entry: siblingRegistration)
 
-// Removing a row keeps installations intact; reusing ordinal zero creates a distinct UUID path.
+// Trash removes both the UUID installation and row; ordinal reuse creates a clean UUID path.
 let secondRegistration = try registrationStore.add(provider: .codex).last!
 require(secondRegistration.ordinal == 1, "the second test registration gets ordinal 1")
 _ = try codexInstallService.install(entry: secondRegistration)
 let secondInstallDirectory = codexInstallService.registrationDirectory(for: secondRegistration)
-_ = try registrationStore.remove(id: secondRegistration.id)
+try codexInstallService.removeRegistration(entry: secondRegistration) {
+    _ = try registrationStore.remove(id: secondRegistration.id)
+}
 require(codexInstallService.registrationInstallStatus(for: originalRegistration) == .installed &&
+        !fileManager.fileExists(atPath: secondInstallDirectory.path) &&
         fileManager.isExecutableFile(atPath: originalInstallExecutable.path),
-        "removing another manual row does not delete the first registration's install")
-_ = try registrationStore.remove(id: originalRegistration.id)
+        "trashing a sibling UUID removes only that installation and preserves the first")
+try codexInstallService.removeRegistration(entry: originalRegistration) {
+    _ = try registrationStore.remove(id: originalRegistration.id)
+}
 let reusedOrdinalRegistration = try registrationStore.add(provider: .codex).last!
 require(reusedOrdinalRegistration.ordinal == 0 && reusedOrdinalRegistration.id != originalRegistration.id,
         "reusing ordinal zero creates a new registration UUID")
@@ -423,14 +440,171 @@ let reusedInstallDirectory = codexInstallService.registrationDirectory(for: reus
 let reusedRuntime = try codexInstallService.isolatedRuntimeEnvironment(for: reusedOrdinalRegistration)
 require(originalInstallDirectory != secondInstallDirectory &&
         originalInstallDirectory != reusedInstallDirectory && secondInstallDirectory != reusedInstallDirectory &&
-        fileManager.isExecutableFile(atPath: originalInstallExecutable.path) &&
+        !fileManager.fileExists(atPath: originalInstallDirectory.path) &&
         fileManager.isExecutableFile(atPath: reusedInstallExecutable.path) &&
-        codexInstallService.registrationInstallStatus(for: originalRegistration) == .installed &&
+        codexInstallService.registrationInstallStatus(for: originalRegistration) == .notInstalled &&
         codexInstallService.registrationInstallStatus(for: reusedOrdinalRegistration) == .installed &&
         reusedRuntime["CODEX_HOME"] != isolatedRuntime["CODEX_HOME"] &&
         reusedRuntime["HOME"] != isolatedRuntime["HOME"] &&
         reusedRuntime["XDG_CACHE_HOME"] != isolatedRuntime["XDG_CACHE_HOME"],
         "different UUIDs have separate surviving installations despite ordinal reuse and removal")
+
+// The trash path removes every file owned by one manual UUID before saving its row deletion.
+let globalCodexBeforeTrash = try Data(contentsOf: syntheticCodex)
+let deleteEntry = try registrationStore.add(provider: .codex).last!
+_ = try codexInstallService.install(entry: deleteEntry)
+let deleteDirectory = codexInstallService.registrationDirectory(for: deleteEntry)
+let deleteInstallation = deleteDirectory.appendingPathComponent("installation", isDirectory: true)
+let fakeAuth = deleteInstallation.appendingPathComponent("codex-home/auth.json")
+let fakeConfig = deleteInstallation.appendingPathComponent("codex-home/config.toml")
+let fakeHistory = deleteInstallation.appendingPathComponent("xdg/data/history.jsonl")
+let fakeCache = deleteInstallation.appendingPathComponent("xdg/cache/codex-cache")
+try Data("synthetic-auth-data".utf8).write(to: fakeAuth)
+try Data("synthetic-config-data".utf8).write(to: fakeConfig)
+try Data("synthetic-history-data".utf8).write(to: fakeHistory)
+try Data("synthetic-cache-data".utf8).write(to: fakeCache)
+var trashObservedAbsentBeforeStoreSave = false
+try codexInstallService.removeRegistration(entry: deleteEntry) {
+    trashObservedAbsentBeforeStoreSave = !fileManager.fileExists(atPath: deleteDirectory.path) &&
+        codexInstallService.registrationInstallStatus(for: deleteEntry) == .notInstalled
+    _ = try registrationStore.remove(id: deleteEntry.id)
+}
+let storeAfterTrash = try registrationStore.load()
+let globalCodexAfterTrash = try Data(contentsOf: syntheticCodex)
+require(trashObservedAbsentBeforeStoreSave &&
+        !fileManager.fileExists(atPath: deleteDirectory.path) &&
+        !fileManager.fileExists(atPath: codexInstallService.registrationOperationLockURL(for: deleteEntry).path) &&
+        !fileManager.fileExists(atPath: fakeAuth.path) &&
+        !fileManager.fileExists(atPath: fakeConfig.path) &&
+        !fileManager.fileExists(atPath: fakeHistory.path) &&
+        !fileManager.fileExists(atPath: fakeCache.path) &&
+        !storeAfterTrash.contains(where: { $0.id == deleteEntry.id }) &&
+        codexInstallService.registrationInstallStatus(for: originalRegistration) == .notInstalled &&
+        codexInstallService.registrationInstallStatus(for: reusedOrdinalRegistration) == .installed &&
+        globalCodexAfterTrash == globalCodexBeforeTrash,
+        "trash verifies complete UUID cleanup before deleting the row and preserves sibling/global installations")
+let freshOrdinalEntry = try registrationStore.add(provider: .codex).last!
+require(freshOrdinalEntry.ordinal == deleteEntry.ordinal && freshOrdinalEntry.id != deleteEntry.id &&
+        codexInstallService.registrationInstallStatus(for: freshOrdinalEntry) == .notInstalled &&
+        !fileManager.fileExists(atPath: codexInstallService.registrationDirectory(for: freshOrdinalEntry).path),
+        "reusing an ordinal allocates a new UUID with no inherited local login or installation")
+_ = try registrationStore.remove(id: freshOrdinalEntry.id)
+
+// A failed persistent save keeps the row and leaves a retryable not-installed state.
+let saveFailureEntry = try registrationStore.add(provider: .codex).last!
+_ = try codexInstallService.install(entry: saveFailureEntry)
+do {
+    try codexInstallService.removeRegistration(entry: saveFailureEntry) {
+        throw NSError(domain: "SyntheticStoreFailure", code: 1)
+    }
+    fatalError("synthetic store save failure must be surfaced")
+} catch {
+}
+let storeAfterSaveFailure = try registrationStore.load()
+require(storeAfterSaveFailure.contains(where: { $0.id == saveFailureEntry.id }) &&
+        codexInstallService.registrationInstallStatus(for: saveFailureEntry) == .notInstalled &&
+        !fileManager.fileExists(atPath: codexInstallService.registrationOperationLockURL(for: saveFailureEntry).path) &&
+        !fileManager.fileExists(atPath: codexInstallService.registrationDirectory(for: saveFailureEntry).path),
+        "failed row persistence keeps the registration visible and the UUID data fully removed for retry")
+try codexInstallService.removeRegistration(entry: saveFailureEntry) {
+    _ = try registrationStore.remove(id: saveFailureEntry.id)
+}
+
+// A symlink escape blocks the whole removal before following or deleting its target.
+let symlinkEntry = try registrationStore.add(provider: .codex).last!
+let symlinkRegistrationDirectory = codexInstallService.registrationDirectory(for: symlinkEntry)
+let outsideUUIDData = testRoot.appendingPathComponent("outside-uuid-data", isDirectory: true)
+try fileManager.createDirectory(at: symlinkRegistrationDirectory, withIntermediateDirectories: true)
+try fileManager.createDirectory(at: outsideUUIDData, withIntermediateDirectories: true)
+let outsideSentinel = outsideUUIDData.appendingPathComponent("preserve-me")
+try Data("outside data".utf8).write(to: outsideSentinel)
+try fileManager.createSymbolicLink(at: symlinkRegistrationDirectory.appendingPathComponent("installation"),
+                                   withDestinationURL: outsideUUIDData)
+do {
+    try codexInstallService.removeRegistration(entry: symlinkEntry) {
+        _ = try registrationStore.remove(id: symlinkEntry.id)
+    }
+    fatalError("symlink escape must reject UUID deletion")
+} catch CLIInstallError.incompleteInstallation {
+}
+let storeAfterSymlinkFailure = try registrationStore.load()
+let outsideDataAfterAttempt = try String(contentsOf: outsideSentinel, encoding: .utf8)
+require(storeAfterSymlinkFailure.contains(where: { $0.id == symlinkEntry.id }) &&
+        outsideDataAfterAttempt == "outside data",
+        "external symlink targets are untouched and the registration remains available")
+try fileManager.removeItem(at: symlinkRegistrationDirectory)
+_ = try registrationStore.remove(id: symlinkEntry.id)
+
+let partialEntry = try registrationStore.add(provider: .codex).last!
+_ = try codexInstallService.install(entry: partialEntry)
+let partialDirectory = codexInstallService.registrationDirectory(for: partialEntry)
+let partialOutside = testRoot.appendingPathComponent("partial-outside", isDirectory: true)
+try fileManager.createDirectory(at: partialOutside, withIntermediateDirectories: true)
+let partialSentinel = partialOutside.appendingPathComponent("preserve-me")
+try Data("partial outside data".utf8).write(to: partialSentinel)
+try fileManager.createSymbolicLink(
+    at: partialDirectory.appendingPathComponent("installation/codex-home/external-link"),
+    withDestinationURL: partialOutside)
+do {
+    try codexInstallService.removeRegistration(entry: partialEntry) {
+        _ = try registrationStore.remove(id: partialEntry.id)
+    }
+    fatalError("partial installation data with an external symlink must block deletion")
+} catch CLIInstallError.incompleteInstallation {
+}
+let partialExecutable = codexInstallService.managedExecutableURL(for: partialEntry)
+let partialRowStillPresent = try registrationStore.load().contains(where: { $0.id == partialEntry.id })
+let partialSentinelValue = try String(contentsOf: partialSentinel, encoding: .utf8)
+require(partialRowStillPresent && fileManager.isExecutableFile(atPath: partialExecutable.path) &&
+        partialSentinelValue == "partial outside data",
+        "failed partial cleanup retains the row and managed package without touching external data")
+try fileManager.removeItem(at: partialDirectory.appendingPathComponent("installation/codex-home/external-link"))
+try codexInstallService.removeRegistration(entry: partialEntry) {
+    _ = try registrationStore.remove(id: partialEntry.id)
+}
+
+// A concurrent operation lock prevents both filesystem cleanup and row deletion.
+let lockEntry = try registrationStore.add(provider: .codex).last!
+let operationLockURL = codexInstallService.registrationOperationLockURL(for: lockEntry)
+try fileManager.createDirectory(at: operationLockURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+let externalLockDescriptor = open(operationLockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+require(externalLockDescriptor >= 0 && flock(externalLockDescriptor, LOCK_EX | LOCK_NB) == 0,
+        "synthetic competing operation obtains the UUID lock")
+var rowRemovalCalledUnderContention = false
+do {
+    try codexInstallService.removeRegistration(entry: lockEntry) {
+        rowRemovalCalledUnderContention = true
+        _ = try registrationStore.remove(id: lockEntry.id)
+    }
+    fatalError("busy UUID lock must block trash")
+} catch CLIInstallError.installationInProgress {
+}
+_ = flock(externalLockDescriptor, LOCK_UN)
+_ = close(externalLockDescriptor)
+let storeAfterLockFailure = try registrationStore.load()
+require(!rowRemovalCalledUnderContention &&
+        storeAfterLockFailure.contains(where: { $0.id == lockEntry.id }),
+        "a competing UUID operation leaves both registration and files untouched")
+_ = try registrationStore.remove(id: lockEntry.id)
+
+// Uninstalled rows can still own data from a previous Desinstalar action; trash clears it.
+let residualEntry = try registrationStore.add(provider: .codex).last!
+let residualDirectory = codexInstallService.registrationDirectory(for: residualEntry)
+let residualConfig = residualDirectory.appendingPathComponent("installation/codex-home/config.toml")
+let residualLogin = residualDirectory.appendingPathComponent("installation/codex-home/auth.json")
+try fileManager.createDirectory(at: residualConfig.deletingLastPathComponent(), withIntermediateDirectories: true)
+try Data("synthetic residual config".utf8).write(to: residualConfig)
+try Data("synthetic residual login".utf8).write(to: residualLogin)
+require(codexInstallService.registrationInstallStatus(for: residualEntry) == .notInstalled,
+        "retained data after ordinary uninstall does not imply an installed CLI")
+try codexInstallService.removeRegistration(entry: residualEntry) {
+    _ = try registrationStore.remove(id: residualEntry.id)
+}
+let storeAfterResidualTrash = try registrationStore.load()
+require(!fileManager.fileExists(atPath: residualDirectory.path) &&
+        !storeAfterResidualTrash.contains(where: { $0.id == residualEntry.id }),
+        "trash of a noninstalled registration also deletes its residual UUID data")
+
 let hostMarkerAfterRepeatedInstalls = try Data(contentsOf: hostMarker)
 let originalCodexAfterRepeatedInstalls = try Data(contentsOf: syntheticCodex)
 require(hostMarkerAfterRepeatedInstalls == hostMarkerBefore &&

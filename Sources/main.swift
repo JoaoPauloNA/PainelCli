@@ -89,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var checkingAuthenticationIDs = Set<UUID>()
     private var cancelledAuthenticationIDs = Set<UUID>()
     private var activeLogoutIDs = Set<UUID>()
+    private var activeRemovalIDs = Set<UUID>()
     private var listItems: [CLIListItem] {
         automaticInstallations.map(CLIListItem.detected) + entries.map(CLIListItem.manual)
     }
@@ -476,6 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.target = self
                 account.action = isAuthenticated ? #selector(logoutCLI(_:)) : #selector(loginCLI(_:))
                 account.isEnabled = !storageLoadFailed &&
+                    (codexRegistration.map { !activeRemovalIDs.contains($0.id) } ?? true) &&
                     (canCancelLogin || (installState == .installed && (isAuthenticated || canStartLogin)))
                 account.contentTintColor = account.isEnabled
                     ? ((canCancelLogin || isAuthenticated) ? .systemOrange : .systemGreen)
@@ -520,14 +522,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     entry.manualEntry.map {
                         !installingRegistrationIDs.contains($0.id) &&
                         !activeLogoutIDs.contains($0.id) &&
+                        !activeRemovalIDs.contains($0.id) &&
+                        !checkingAuthenticationIDs.contains($0.id) &&
+                        !isAuthenticationRunningState(authenticationUIState(for: $0)) &&
                         authenticationProcesses[$0.id]?.isRunning != true
                     } == true
                 remove.contentTintColor = remove.isEnabled ? .systemRed : .disabledControlTextColor
                 remove.toolTip = isManualEntry
-                    ? "Remover \(entry.displayName) da lista"
+                    ? (entry.manualEntry?.provider == CLIProvider.codex.rawValue
+                        ? "Remover \(entry.displayName) e apagar definitivamente os dados locais deste UUID"
+                        : "Remover definitivamente o cadastro \(entry.displayName)")
                     : "Instalações detectadas não podem ser removidas daqui"
                 remove.setAccessibilityLabel(isManualEntry
-                    ? "Remover \(entry.displayName) da lista"
+                    ? "Remover definitivamente o cadastro e os dados de \(entry.displayName)"
                     : "Remoção indisponível para instalação detectada \(entry.displayName)")
                 remove.setAccessibilityValue(remove.isEnabled ? "Disponível" : "Inativo")
                 applyActionAppearance(remove)
@@ -638,6 +645,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func canStartAuthentication(for entry: CLIEntry) -> Bool {
         guard installService?.registrationInstallStatus(for: entry) == .installed,
+              !activeRemovalIDs.contains(entry.id),
               !checkingAuthenticationIDs.contains(entry.id),
               authenticationProcesses[entry.id]?.isRunning != true else { return false }
         switch authenticationUIState(for: entry) {
@@ -665,7 +673,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               entry.provider == CLIProvider.codex.rawValue,
               installService != nil,
               !installingRegistrationIDs.contains(entry.id),
-              !activeLogoutIDs.contains(entry.id) else { return false }
+              !activeLogoutIDs.contains(entry.id),
+              !activeRemovalIDs.contains(entry.id) else { return false }
         return registrationInstallState(for: entry).canInstall
     }
 
@@ -673,6 +682,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !storageLoadFailed, entry.provider == CLIProvider.codex.rawValue,
               !installingRegistrationIDs.contains(entry.id),
               !activeLogoutIDs.contains(entry.id),
+              !activeRemovalIDs.contains(entry.id),
               !checkingAuthenticationIDs.contains(entry.id),
               authenticationProcesses[entry.id]?.isRunning != true else { return false }
         return registrationInstallState(for: entry) == .installed
@@ -731,15 +741,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func removeCLI(_ sender: NSButton) {
         guard !storageLoadFailed, let entryStore, listItems.indices.contains(sender.tag),
               let entry = listItems[sender.tag].manualEntry,
-              !installingRegistrationIDs.contains(entry.id) else { return }
-        let id = entry.id
-        do {
-            entries = try entryStore.remove(id: id)
-            refreshCLIEntries()
-            render(.settings)
-        } catch {
-            showStoreFailure("Não foi possível remover o registro. Os dados existentes foram preservados.")
+              !installingRegistrationIDs.contains(entry.id),
+              !activeLogoutIDs.contains(entry.id),
+              !activeRemovalIDs.contains(entry.id),
+              !checkingAuthenticationIDs.contains(entry.id),
+              !isAuthenticationRunningState(authenticationUIState(for: entry)),
+              authenticationProcesses[entry.id]?.isRunning != true else { return }
+
+        let isManagedCodex = entry.provider == CLIProvider.codex.rawValue
+        guard !isManagedCodex || installService != nil else { return }
+        let service = installService
+        let alert = NSAlert()
+        alert.messageText = "Remover definitivamente \(entry.displayName)?"
+        alert.informativeText = isManagedCodex
+            ? "Esta ação apagará o CLI gerenciado deste cadastro, suas configurações, histórico, caches e login local. Não pode ser desfeita. Instalações globais e outros cadastros não serão alterados; não será enviado logout nem revogada uma sessão remota."
+            : "Esta ação removerá o cadastro \(entry.displayName) da lista. Não pode ser desfeita e não altera instalações detectadas ou globais."
+        alert.alertStyle = .critical
+        let cancelButton = alert.addButton(withTitle: "Cancelar")
+        cancelButton.keyEquivalent = "\r"
+        let removeButton = alert.addButton(withTitle: "Remover definitivamente")
+        removeButton.hasDestructiveAction = true
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+
+        activeRemovalIDs.insert(entry.id)
+        render(.settings)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<Void, Error>
+            do {
+                if isManagedCodex {
+                    guard let service else { throw CLIInstallError.unsupportedProvider }
+                    try service.removeRegistration(entry: entry) {
+                        _ = try entryStore.remove(id: entry.id)
+                    }
+                } else {
+                    _ = try entryStore.remove(id: entry.id)
+                }
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.activeRemovalIDs.remove(entry.id)
+                self.refreshCLIEntries()
+                switch result {
+                case .success:
+                    self.showRegistrationRemovalResult(
+                        title: "Cadastro removido",
+                        message: isManagedCodex
+                            ? "O pacote e os dados locais deste UUID foram apagados. A ação Desinstalar preserva o cadastro; a lixeira remove ambos. Nenhuma sessão remota foi revogada."
+                            : "O cadastro foi removido. Instalações detectadas e globais não foram alteradas.")
+                case .failure(let error):
+                    self.showRegistrationRemovalResult(
+                        title: "Cadastro mantido",
+                        message: error.localizedDescription + " A entrada continua disponível para nova tentativa.")
+                }
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
         }
+    }
+
+    private func showRegistrationRemovalResult(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = title == "Cadastro removido" ? .informational : .warning
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
     }
 
     @objc private func installCLI(_ sender: NSButton) {
@@ -872,6 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 process.waitUntilExit()
                 readerFinished.wait()
+                session.releaseOperationLock()
                 let verifiedAuthenticationStatus: Result<CLIAuthenticationStatus, Error>
                 do { verifiedAuthenticationStatus = .success(try service.authenticationStatus(for: entry)) }
                 catch { verifiedAuthenticationStatus = .failure(error) }

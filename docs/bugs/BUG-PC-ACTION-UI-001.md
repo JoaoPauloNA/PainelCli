@@ -21,7 +21,7 @@ Observado: inconsistências acima confirmadas somente por inspeção estática. 
 - Controles preservam 28 × 28 pt e espaçamento de 8 pt.
 - Sair: `power`; Desinstalar: `shippingbox`; Remover: `trash`; Instalar: `arrow.down.circle`.
 - Login habilitado verde, logout/cancelar/desinstalar laranja, remover vermelho; desativados cinza semântico.
-- Confirmações e semântica de preservação de dados/credenciais mantidas literalmente.
+- Confirmações seguem a separação das ações: Desinstalar preserva dados; lixeira confirma a exclusão definitiva dos dados locais UUID-scoped.
 
 ## Regressão
 

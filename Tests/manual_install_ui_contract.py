@@ -8,6 +8,43 @@ source = (root / "Sources/main.swift").read_text(encoding="utf-8")
 installer = (root / "Sources/CLIInstaller.swift").read_text(encoding="utf-8")
 failures: list[str] = []
 
+remove_start = source.find("@objc private func removeCLI(_ sender: NSButton) {")
+remove_end = source.find("\n    @objc private func installCLI", remove_start)
+remove_handler = source[remove_start:remove_end] if remove_start >= 0 and remove_end > remove_start else ""
+if "service.removeRegistration(entry:" not in remove_handler:
+    failures.append("trash action removes a manual row without uninstalling its UUID-managed package")
+remove_call = remove_handler.find("service.removeRegistration(entry:")
+store_call = remove_handler.find("entryStore.remove(id:")
+if store_call < 0 or remove_call < 0 or store_call < remove_call:
+    failures.append("trash action does not sequence scoped uninstall before persistent row removal")
+cancel_index = remove_handler.find('alert.addButton(withTitle: "Cancelar")')
+destructive_index = remove_handler.find('alert.addButton(withTitle: "Remover definitivamente")')
+if cancel_index < 0 or destructive_index < 0 or cancel_index > destructive_index or \
+        'alert.runModal() == .alertSecondButtonReturn' not in remove_handler:
+    failures.append("trash confirmation lacks a safe cancel default and a distinct destructive choice")
+if "hasDestructiveAction = true" not in remove_handler or "Não pode ser desfeita" not in remove_handler:
+    failures.append("trash confirmation does not clearly mark irreversible removal")
+if "login local" not in remove_handler or "logout" not in remove_handler or "outros cadastros" not in remove_handler:
+    failures.append("trash confirmation does not state local-auth scope or avoid remote logout claims")
+if "listItems[sender.tag].manualEntry" not in remove_handler:
+    failures.append("trash action is not restricted to manual registrations")
+if "activeRemovalIDs.insert(entry.id)" not in remove_handler:
+    failures.append("trash action does not serialize repeated UI clicks while deletion runs")
+confirm_index = remove_handler.find("alert.runModal() == .alertSecondButtonReturn")
+active_remove_index = remove_handler.find("activeRemovalIDs.insert(entry.id)")
+if confirm_index < 0 or active_remove_index < confirm_index or \
+        remove_handler.find("service.removeRegistration(entry:") < active_remove_index:
+    failures.append("trash side effects can begin before the user chooses the destructive confirmation")
+removal_start = installer.find("func removeRegistration(entry: CLIEntry, removeRecord: () throws -> Void) throws {")
+removal_end = installer.find("\n    private func removeManagedPackageAndManifest", removal_start)
+removal_service = installer[removal_start:removal_end] if removal_start >= 0 and removal_end > removal_start else ""
+if "acquireRegistrationLock(for: entry)" not in removal_service or "symlinksStayInside(directory)" not in removal_service:
+    failures.append("UUID deletion does not share the operation lock and reject symlink escapes")
+if "removeRecord()" not in removal_service or removal_service.find("removeRecord()") < removal_service.find("!fileManager.fileExists"):
+    failures.append("persistent row removal can occur before the UUID directory is confirmed absent")
+if "func startAuthentication" in installer and "operationLock: operationLock" not in installer:
+    failures.append("browser authentication does not hold the UUID lock for the active process lifetime")
+
 row_start = source.find("if let manualEntry = entry.manualEntry,\n                   manualEntry.provider == CLIProvider.codex.rawValue {")
 row_end = source.find("\n                }\n                let separator", row_start)
 row = source[row_start:row_end] if row_start >= 0 and row_end > row_start else ""

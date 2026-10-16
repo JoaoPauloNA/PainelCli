@@ -113,7 +113,7 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
         case .installationInProgress:
             return "A instalação deste cadastro já está em andamento."
         case .incompleteInstallation:
-            return "A instalação isolada não pôde ser validada; este cadastro continua não instalado."
+            return "Os dados deste UUID não puderam ser validados com segurança; o cadastro foi mantido sem declarar a remoção concluída."
         case .commandFailed(let status):
             return "npm terminou com erro (código \(status)); este cadastro não foi marcado como instalado."
         case .commandTimedOut:
@@ -194,10 +194,39 @@ enum CLIRegistrationInstallStatus: Equatable {
 typealias CLICommandRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Int32
 typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ input: Pipe, _ output: Pipe) throws -> Process
 
+final class CLIRegistrationOperationLock {
+    private let lock = NSLock()
+    private var descriptor: Int32?
+
+    init(descriptor: Int32) { self.descriptor = descriptor }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let descriptor else { return }
+        _ = flock(descriptor, LOCK_UN)
+        _ = close(descriptor)
+        self.descriptor = nil
+    }
+
+    deinit { release() }
+}
+
 struct CLIAuthenticationSession {
     let process: Process
     let input: Pipe
     let output: Pipe
+    private let operationLock: CLIRegistrationOperationLock
+
+    init(process: Process, input: Pipe, output: Pipe,
+         operationLock: CLIRegistrationOperationLock) {
+        self.process = process
+        self.input = input
+        self.output = output
+        self.operationLock = operationLock
+    }
+
+    func releaseOperationLock() { operationLock.release() }
 }
 
 enum CLIAppServerLoginProtocol {
@@ -354,6 +383,14 @@ struct CLIInstallService {
     @discardableResult
     func install(entry: CLIEntry) throws -> URL {
         guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
+        let directory = registrationDirectory(for: entry)
+        if fileManager.fileExists(atPath: directory.path) {
+            guard isSafeRegistrationDirectory(directory),
+                  try symlinksStayInside(directory) else {
+                throw CLIInstallError.incompleteInstallation
+            }
+        }
+
         switch registrationInstallStatus(for: entry) {
         case .installed: throw CLIInstallError.alreadyInstalled
         case .installing: throw CLIInstallError.installationInProgress
@@ -371,8 +408,8 @@ struct CLIInstallService {
         let registrationDirectory = registrationDirectory(for: entry)
         try fileManager.createDirectory(at: registrationDirectory, withIntermediateDirectories: true)
         try setPrivatePermissions(registrationDirectory)
-        let lockDescriptor = try acquireRegistrationLock(for: entry)
-        defer { releaseRegistrationLock(lockDescriptor) }
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
 
         // Re-check after acquiring the per-UUID lock so concurrent clicks cannot duplicate work.
         switch registrationInstallStatus(for: entry) {
@@ -475,19 +512,75 @@ struct CLIInstallService {
     /// including auth.json, config, history, and caches, remains available for reinstall.
     func uninstall(entry: CLIEntry) throws {
         guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
-        let lockDescriptor = try acquireRegistrationLock(for: entry)
-        defer { releaseRegistrationLock(lockDescriptor) }
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
         }
-        let root = installationRoot(for: entry)
-        let package = root.appendingPathComponent("package", isDirectory: true)
-        let manifest = root.appendingPathComponent("install.json")
-        guard isRealDirectory(root), isRealDirectory(package), isRegularFile(manifest) else {
+        try removeManagedPackageAndManifest(for: entry)
+    }
+
+    /// Permanently removes all data owned by this manual UUID and saves its row deletion
+    /// while holding the same lock used by install, login, logout, and ordinary uninstall.
+    /// The optional removal closure runs only after the UUID directory is confirmed absent.
+    func removeRegistration(entry: CLIEntry, removeRecord: () throws -> Void) throws {
+        guard entry.origin == .manual, entry.provider == CLIProvider.codex.rawValue else {
+            throw CLIInstallError.unsupportedProvider
+        }
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
+
+        let directory = registrationDirectory(for: entry)
+        if fileManager.fileExists(atPath: directory.path) {
+            guard isSafeRegistrationDirectory(directory),
+                  try symlinksStayInside(directory) else {
+                throw CLIInstallError.incompleteInstallation
+            }
+        }
+
+        switch registrationInstallStatus(for: entry) {
+        case .installed, .incomplete, .notInstalled:
+            break
+        case .installing:
+            throw CLIInstallError.installationInProgress
+        case .unsupported:
+            throw CLIInstallError.unsupportedProvider
+        case .failed:
             throw CLIInstallError.incompleteInstallation
         }
-        try fileManager.removeItem(at: package)
-        try fileManager.removeItem(at: manifest)
+
+        if fileManager.fileExists(atPath: directory.path) {
+            try fileManager.removeItem(at: directory)
+        }
+        guard !fileManager.fileExists(atPath: directory.path),
+              registrationInstallStatus(for: entry) == .notInstalled else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let lockRegistryDescriptor = try acquireLockRegistry()
+        defer { releaseLockRegistry(lockRegistryDescriptor) }
+        let lockURL = registrationOperationLockURL(for: entry)
+        if unlink(lockURL.path) != 0 && errno != ENOENT {
+            throw CLIInstallError.installationInProgress
+        }
+        operationLock.release()
+        try removeRecord()
+    }
+
+    private func removeManagedPackageAndManifest(for entry: CLIEntry) throws {
+        let root = installationRoot(for: entry)
+        if fileManager.fileExists(atPath: root.path) {
+            guard isRealDirectory(root) else { throw CLIInstallError.incompleteInstallation }
+            let package = root.appendingPathComponent("package", isDirectory: true)
+            let manifest = root.appendingPathComponent("install.json")
+            if fileManager.fileExists(atPath: package.path) {
+                guard isRealDirectory(package) else { throw CLIInstallError.incompleteInstallation }
+                try fileManager.removeItem(at: package)
+            }
+            if fileManager.fileExists(atPath: manifest.path) {
+                guard isRegularFile(manifest) else { throw CLIInstallError.incompleteInstallation }
+                try fileManager.removeItem(at: manifest)
+            }
+        }
         guard registrationInstallStatus(for: entry) == .notInstalled else {
             throw CLIInstallError.incompleteInstallation
         }
@@ -548,8 +641,8 @@ struct CLIInstallService {
     /// then requires the same isolated CLI to confirm that it is signed out.
     func logout(for entry: CLIEntry) throws -> CLIAuthenticationStatus {
         guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
-        let lockDescriptor = try acquireRegistrationLock(for: entry)
-        defer { releaseRegistrationLock(lockDescriptor) }
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
         }
@@ -566,6 +659,7 @@ struct CLIInstallService {
     /// Starts the official CLI app-server with this registration's isolated environment.
     /// Starts the browser OAuth flow through the official Codex app-server.
     func startAuthentication(for entry: CLIEntry) throws -> CLIAuthenticationSession {
+        let operationLock = try acquireRegistrationLock(for: entry)
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
         }
@@ -580,12 +674,13 @@ struct CLIInstallService {
                                                         isolatedRuntimeEnvironment(for: entry), input, output)
         if let initialize = CLIAppServerLoginProtocol.message(
             id: 1, method: "initialize", params: [
-                "clientInfo": ["name": "PainelCli", "title": "PainelCli", "version": "0.0.0.27"],
+                "clientInfo": ["name": "PainelCli", "title": "PainelCli", "version": "0.0.0.29"],
                 "capabilities": ["experimentalApi": true]
             ]) {
             input.fileHandleForWriting.write(initialize)
         }
-        return CLIAuthenticationSession(process: process, input: input, output: output)
+        return CLIAuthenticationSession(process: process, input: input, output: output,
+                                        operationLock: operationLock)
     }
 
     func openBrowserAuthenticationPage(for entry: CLIEntry, authURL: URL) throws -> Bool {
@@ -751,13 +846,32 @@ struct CLIInstallService {
                                       ofItemAtPath: url.path)
     }
 
-    private func acquireRegistrationLock(for entry: CLIEntry) throws -> Int32 {
-        let directory = registrationDirectory(for: entry)
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        try setPrivatePermissions(directory)
-        let url = directory.appendingPathComponent(".install.lock")
-        let descriptor = open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+    func registrationOperationLockURL(for entry: CLIEntry) -> URL {
+        applicationDirectory.appendingPathComponent("RegistrationLocks", isDirectory: true)
+            .appendingPathComponent("\(entry.id.uuidString).lock", isDirectory: false)
+    }
+
+    private func acquireLockRegistry() throws -> Int32 {
+        let lockDirectory = applicationDirectory.appendingPathComponent("RegistrationLocks", isDirectory: true)
+        try fileManager.createDirectory(at: lockDirectory, withIntermediateDirectories: true)
+        guard isOwnedRealDirectory(lockDirectory),
+              lockDirectory.resolvingSymlinksInPath().standardizedFileURL == lockDirectory.standardizedFileURL else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        try setPrivatePermissions(lockDirectory)
+        let url = lockDirectory.appendingPathComponent("registry.lock")
+        let descriptor = open(url.path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
         guard descriptor >= 0 else { throw CLIInstallError.installationInProgress }
+        var lockInfo = stat()
+        guard fstat(descriptor, &lockInfo) == 0,
+              (lockInfo.st_mode & S_IFMT) == S_IFREG, lockInfo.st_uid == getuid() else {
+            _ = close(descriptor)
+            throw CLIInstallError.installationInProgress
+        }
+        guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+            _ = close(descriptor)
+            throw CLIInstallError.installationInProgress
+        }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             _ = close(descriptor)
             throw CLIInstallError.installationInProgress
@@ -765,9 +879,60 @@ struct CLIInstallService {
         return descriptor
     }
 
-    private func releaseRegistrationLock(_ descriptor: Int32) {
+    private func releaseLockRegistry(_ descriptor: Int32) {
         _ = flock(descriptor, LOCK_UN)
         _ = close(descriptor)
+    }
+
+    private func acquireRegistrationLock(for entry: CLIEntry) throws -> CLIRegistrationOperationLock {
+        let registryDescriptor = try acquireLockRegistry()
+        defer { releaseLockRegistry(registryDescriptor) }
+        let url = registrationOperationLockURL(for: entry)
+        let descriptor = open(url.path, O_CREAT | O_RDWR | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw CLIInstallError.installationInProgress }
+        var lockInfo = stat()
+        guard fstat(descriptor, &lockInfo) == 0,
+              (lockInfo.st_mode & S_IFMT) == S_IFREG, lockInfo.st_uid == getuid() else {
+            _ = close(descriptor)
+            throw CLIInstallError.installationInProgress
+        }
+        guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+            _ = close(descriptor)
+            throw CLIInstallError.installationInProgress
+        }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            _ = close(descriptor)
+            throw CLIInstallError.installationInProgress
+        }
+        return CLIRegistrationOperationLock(descriptor: descriptor)
+    }
+
+    private func symlinksStayInside(_ root: URL) throws -> Bool {
+        let rootPath = root.standardizedFileURL.path
+        guard let enumerator = fileManager.enumerator(at: root,
+                                                     includingPropertiesForKeys: nil,
+                                                     options: []) else { return false }
+        for case let item as URL in enumerator {
+            var info = stat()
+            guard lstat(item.path, &info) == 0, info.st_uid == getuid() else { return false }
+            guard (info.st_mode & S_IFMT) == S_IFLNK else { continue }
+            let rawTarget = try fileManager.destinationOfSymbolicLink(atPath: item.path)
+            let target = rawTarget.hasPrefix("/")
+                ? URL(fileURLWithPath: rawTarget)
+                : item.deletingLastPathComponent().appendingPathComponent(rawTarget)
+            let resolvedPath = target.standardizedFileURL.resolvingSymlinksInPath().path
+            guard resolvedPath == rootPath || resolvedPath.hasPrefix(rootPath + "/") else { return false }
+        }
+        return true
+    }
+
+    private func isSafeRegistrationDirectory(_ directory: URL) -> Bool {
+        let registrations = applicationDirectory.appendingPathComponent("Registrations", isDirectory: true)
+        let paths = [applicationDirectory, registrations, directory]
+        return paths.allSatisfy {
+            isOwnedRealDirectory($0) &&
+                $0.resolvingSymlinksInPath().standardizedFileURL == $0.standardizedFileURL
+        }
     }
 
     private func copyRetainedRegistrationData(from source: URL, to destination: URL) throws {
@@ -814,6 +979,12 @@ struct CLIInstallService {
     private func isRealDirectory(_ url: URL) -> Bool {
         var info = stat()
         return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private func isOwnedRealDirectory(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 &&
+            (info.st_mode & S_IFMT) == S_IFDIR && info.st_uid == getuid()
     }
 
     private func isRegularFile(_ url: URL) -> Bool {
