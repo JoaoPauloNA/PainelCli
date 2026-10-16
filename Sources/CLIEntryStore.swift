@@ -50,6 +50,7 @@ struct CLIEntry: Codable, Equatable, Identifiable {
         try values.encode(provider, forKey: .provider)
         try values.encode(ordinal, forKey: .ordinal)
         try values.encode(CLIEntryOrigin.manual, forKey: .origin)
+        try values.encodeIfPresent(detectedPath, forKey: .detectedPath)
     }
 }
 
@@ -97,6 +98,7 @@ struct CLIEntryStore {
     func snapshot(discoveries: [CLIDiscovery]) throws -> CLIListSnapshot {
         var document = try loadDocument()
         let migrated = Self.migrateLegacyAutomaticEntries(in: &document)
+        Self.migrateManualOrdinals(in: &document)
         let legacyGeminiCount = document.entries.filter {
             $0.origin == .manual && $0.provider == "GeminiCLI"
         }.count
@@ -125,7 +127,7 @@ struct CLIEntryStore {
         if migrationNeedsDecision {
             notice = "Cadastro(s) GeminiCLI legado(s) preservado(s). Há uma CLI Gemini real ou colisão de ordinais; confirme o destino antes de migrar para Antigravity CLI."
         } else if legacyGeminiCount > 0 {
-            notice = "Cadastro(s) do catálogo GeminiCLI migrado(s) para Antigravity CLI; IDs e ordinais foram preservados. Nenhuma instalação, configuração ou credencial foi alterada."
+            notice = "Cadastro(s) do catálogo GeminiCLI migrado(s) para Antigravity CLI; IDs foram preservados e os ordinais seguiram a migração única de numeração. Nenhuma instalação, configuração ou credencial foi alterada."
         } else {
             notice = nil
         }
@@ -138,14 +140,21 @@ struct CLIEntryStore {
     func add(provider: CLIProvider) throws -> [CLIEntry] {
         var document = try loadDocument()
         _ = Self.migrateLegacyAutomaticEntries(in: &document)
+        Self.migrateManualOrdinals(in: &document)
         document.entries = document.entries.filter { $0.origin == .manual }
         document.highestOrdinals = Self.manualHighWater(document.entries,
                                                        preserving: document.highestOrdinals)
-        let lastOrdinal = document.highestOrdinals[provider.rawValue] ?? 0
-        guard lastOrdinal < Int.max else { throw StoreError.invalidEntries }
-        let nextOrdinal = lastOrdinal + 1
+        let occupied = Set(document.entries
+            .filter { $0.origin == .manual && $0.provider == provider.rawValue }
+            .map(\.ordinal))
+        var nextOrdinal = 0
+        while occupied.contains(nextOrdinal) {
+            guard nextOrdinal < Int.max else { throw StoreError.invalidEntries }
+            nextOrdinal += 1
+        }
         document.entries.append(CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: nextOrdinal))
-        document.highestOrdinals[provider.rawValue] = nextOrdinal
+        document.highestOrdinals[provider.rawValue] = max(
+            document.highestOrdinals[provider.rawValue] ?? 0, nextOrdinal)
         try save(document)
         return document.entries
     }
@@ -154,6 +163,7 @@ struct CLIEntryStore {
     func remove(id: UUID, suppressingDiscoveryPaths: [String] = []) throws -> [CLIEntry] {
         var document = try loadDocument()
         _ = Self.migrateLegacyAutomaticEntries(in: &document)
+        Self.migrateManualOrdinals(in: &document)
         document.entries = document.entries.filter { $0.origin == .manual }
         guard let index = document.entries.firstIndex(where: { $0.id == id }) else {
             throw StoreError.entryNotFound
@@ -167,7 +177,7 @@ struct CLIEntryStore {
 
     private func loadDocument() throws -> StoreDocument {
         guard fileManager.fileExists(atPath: fileURL.path) else {
-            return StoreDocument(entries: [], highestOrdinals: [:])
+            return StoreDocument(entries: [], highestOrdinals: [:], schemaVersion: 1)
         }
         let data = try Data(contentsOf: fileURL)
         if let topLevel = try? JSONSerialization.jsonObject(with: data), topLevel is [Any] {
@@ -175,7 +185,8 @@ struct CLIEntryStore {
             try Self.validate(entries)
             return StoreDocument(entries: entries,
                                  highestOrdinals: Dictionary(grouping: entries, by: \.provider)
-                                    .mapValues { $0.map(\.ordinal).max() ?? 0 })
+                                    .mapValues { $0.map(\.ordinal).max() ?? 0 },
+                                 schemaVersion: 0)
         }
         let document = try JSONDecoder().decode(StoreDocument.self, from: data)
         try Self.validate(document.entries)
@@ -240,7 +251,9 @@ struct CLIEntryStore {
             let legacy = document.entries[index]
             document.entries[index] = CLIEntry(id: legacy.id,
                                                 provider: CLIProvider.antigravity.rawValue,
-                                                ordinal: legacy.ordinal)
+                                                ordinal: legacy.ordinal,
+                                                origin: legacy.origin,
+                                                detectedPath: legacy.detectedPath)
         }
         let oldHighWater = document.highestOrdinals["GeminiCLI"] ?? legacyEntries.map(\.ordinal).max() ?? 0
         document.highestOrdinals[CLIProvider.antigravity.rawValue] = max(
@@ -257,6 +270,34 @@ struct CLIEntryStore {
         return result
     }
 
+    /// Compacts pre-zero-based manual registrations once, independently per provider.
+    /// Sorting by old ordinal and then UUID makes the migration deterministic while keeping
+    /// each registration's identity and metadata attached to its row.
+    private static func migrateManualOrdinals(in document: inout StoreDocument) {
+        guard document.schemaVersion < 1 else { return }
+        let manualIndices = document.entries.indices.filter {
+            document.entries[$0].origin == .manual
+        }
+        let grouped = Dictionary(grouping: manualIndices, by: { document.entries[$0].provider })
+        for indices in grouped.values {
+            let ordered = indices.sorted { lhs, rhs in
+                let left = document.entries[lhs]
+                let right = document.entries[rhs]
+                if left.ordinal != right.ordinal { return left.ordinal < right.ordinal }
+                return left.id.uuidString < right.id.uuidString
+            }
+            for (ordinal, index) in ordered.enumerated() {
+                let entry = document.entries[index]
+                document.entries[index] = CLIEntry(id: entry.id,
+                                                    provider: entry.provider,
+                                                    ordinal: ordinal,
+                                                    origin: entry.origin,
+                                                    detectedPath: entry.detectedPath)
+            }
+        }
+        document.schemaVersion = 1
+    }
+
     private static func validate(_ entries: [CLIEntry]) throws {
         var ids = Set<UUID>()
         var providerOrdinals = Set<String>()
@@ -264,7 +305,7 @@ struct CLIEntryStore {
             let validDetection = entry.origin == .automatic
                 ? entry.detectedPath?.isEmpty == false
                 : entry.detectedPath == nil
-            guard !entry.provider.isEmpty, entry.ordinal > 0,
+            guard !entry.provider.isEmpty, entry.ordinal >= 0,
                   validDetection,
                   ids.insert(entry.id).inserted,
                   providerOrdinals.insert("\(entry.provider)\u{0}\(entry.ordinal)").inserted else {
@@ -290,15 +331,18 @@ struct CLIEntryStore {
         var entries: [CLIEntry]
         var highestOrdinals: [String: Int]
         var automaticIDs: [String: UUID]
+        var schemaVersion: Int
 
         private enum CodingKeys: String, CodingKey {
-            case entries, highestOrdinals, automaticIDs, hiddenDiscoveries
+            case entries, highestOrdinals, automaticIDs, hiddenDiscoveries, schemaVersion
         }
 
-        init(entries: [CLIEntry], highestOrdinals: [String: Int], automaticIDs: [String: UUID] = [:]) {
+        init(entries: [CLIEntry], highestOrdinals: [String: Int], automaticIDs: [String: UUID] = [:],
+             schemaVersion: Int = 0) {
             self.entries = entries
             self.highestOrdinals = highestOrdinals
             self.automaticIDs = automaticIDs
+            self.schemaVersion = schemaVersion
         }
 
         init(from decoder: Decoder) throws {
@@ -306,6 +350,7 @@ struct CLIEntryStore {
             entries = try values.decode([CLIEntry].self, forKey: .entries)
             highestOrdinals = try values.decode([String: Int].self, forKey: .highestOrdinals)
             automaticIDs = try values.decodeIfPresent([String: UUID].self, forKey: .automaticIDs) ?? [:]
+            schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
             // `hiddenDiscoveries` is accepted for migration and intentionally never retained.
         }
 
@@ -314,6 +359,7 @@ struct CLIEntryStore {
             try values.encode(entries.filter { $0.origin == .manual }, forKey: .entries)
             try values.encode(highestOrdinals, forKey: .highestOrdinals)
             try values.encode(automaticIDs, forKey: .automaticIDs)
+            try values.encode(schemaVersion, forKey: .schemaVersion)
         }
     }
 }

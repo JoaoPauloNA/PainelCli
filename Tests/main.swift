@@ -12,7 +12,8 @@ func createSyntheticExecutable(_ url: URL, contents: String = "synthetic executa
 }
 
 func writeStoreDocument(_ store: CLIEntryStore, entries: [CLIEntry],
-                        highestOrdinals: [String: Int], hiddenDiscoveries: [String] = []) throws {
+                        highestOrdinals: [String: Int], hiddenDiscoveries: [String] = [],
+                        schemaVersion: Int = 1) throws {
     try FileManager.default.createDirectory(at: store.fileURL.deletingLastPathComponent(),
                                             withIntermediateDirectories: true)
     let serializedEntries: [[String: Any]] = entries.map { entry in
@@ -26,7 +27,8 @@ func writeStoreDocument(_ store: CLIEntryStore, entries: [CLIEntry],
     let document: [String: Any] = [
         "entries": serializedEntries,
         "highestOrdinals": highestOrdinals,
-        "hiddenDiscoveries": hiddenDiscoveries
+        "hiddenDiscoveries": hiddenDiscoveries,
+        "schemaVersion": schemaVersion
     ]
     try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
         .write(to: store.fileURL, options: .atomic)
@@ -49,22 +51,30 @@ require(CLIDiscoveryTarget.gemini.executableName == "gemini" &&
         CLIDiscoveryTarget.antigravity.executableName == "agy",
         "Gemini remains an independent detection target")
 
-// Manual registration duplicates have stable IDs and separate provider ordinals.
+// Manual numbering starts at zero independently per provider. Detections never occupy ordinals.
 let store = CLIEntryStore(applicationSupportDirectory: testRoot)
 let codex1 = try store.add(provider: .codex)[0]
 let codex2 = try store.add(provider: .codex).last!
+let codex3 = try store.add(provider: .codex).last!
 let claude1 = try store.add(provider: .claude).last!
-require(codex1.displayName == "CodexCLI 1" && codex2.displayName == "CodexCLI 2" &&
-        claude1.displayName == "ClaudeCLI 1", "manual numbering remains provider-scoped")
+require(codex1.displayName == "CodexCLI 0" && codex2.displayName == "CodexCLI 1" &&
+        codex3.displayName == "CodexCLI 2" && claude1.displayName == "ClaudeCLI 0",
+        "manual numbering starts at zero per provider")
 let antigravity1 = try store.add(provider: .antigravity).last!
-require(antigravity1.displayName == "Antigravity CLI 1", "catalog rows use the official Antigravity name")
+require(antigravity1.displayName == "Antigravity CLI 0", "catalog rows use the official Antigravity name")
 let persistedRegistrations = try store.load()
-require(persistedRegistrations.count == 4, "manual registrations persist")
+require(persistedRegistrations.count == 5, "manual registrations persist")
 let removedCodex = try store.remove(id: codex2.id)
 require(!removedCodex.contains(where: { $0.id == codex2.id }), "manual row removal remains functional")
 let nextCodex = try store.add(provider: .codex).last
-require(nextCodex?.ordinal == 3,
-        "manual ordinals are not reused after removal")
+require(nextCodex?.ordinal == 1,
+        "manual allocation reuses the smallest available ordinal")
+_ = try store.remove(id: codex1.id)
+_ = try store.remove(id: codex3.id)
+_ = try store.remove(id: nextCodex!.id)
+let codexAfterDeleteAll = try store.add(provider: .codex).last
+require(codexAfterDeleteAll?.ordinal == 0,
+        "deleting every provider registration makes ordinal zero available again")
 
 // Registration installs are hard-blocked before any path creation or process operation.
 let isolationRoot = testRoot.appendingPathComponent("isolation-block", isDirectory: true)
@@ -123,30 +133,44 @@ require(discoveries.first(where: { $0.target == .claude })?.executableURL == syn
 require(!fileManager.fileExists(atPath: shouldNotRunMarker.path),
         "discovery never executes a synthetic CLI")
 
+let detectedOnlyStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("detected-only"))
+_ = try detectedOnlyStore.snapshot(discoveries: discoveries)
+let codexAfterDetection = try detectedOnlyStore.add(provider: .codex).last
+require(codexAfterDetection?.ordinal == 0, "automatic detections do not occupy manual ordinals")
+
 // Catalog-origin Gemini registrations migrate only when no actual Gemini is detected and
-// the original ordinal can be kept without collision. IDs, ordinals, and high-water survive.
+// their one-time zero-based ordinals do not collide with existing Antigravity registrations.
 let legacyMigrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("legacy-migration"))
 let legacyGeminiID = UUID()
 let oldCodexID = UUID()
+let olderCodexID = UUID()
 try writeStoreDocument(legacyMigrationStore, entries: [
     CLIEntry(id: legacyGeminiID, provider: "GeminiCLI", ordinal: 2),
-    CLIEntry(id: oldCodexID, provider: "CodexCLI", ordinal: 1)
-], highestOrdinals: ["GeminiCLI": 4, "CodexCLI": 1],
-   hiddenDiscoveries: [syntheticGemini.path])
+    CLIEntry(id: oldCodexID, provider: "CodexCLI", ordinal: 9),
+    CLIEntry(id: olderCodexID, provider: "CodexCLI", ordinal: 4)
+], highestOrdinals: ["GeminiCLI": 4, "CodexCLI": 90],
+   hiddenDiscoveries: [syntheticGemini.path], schemaVersion: 0)
 let noRealGemini = discoveries.filter { $0.target != .gemini }
 let migratedSnapshot = try legacyMigrationStore.snapshot(discoveries: noRealGemini)
 let migratedGemini = migratedSnapshot.manualRegistrations.first(where: { $0.id == legacyGeminiID })
 require(migratedGemini?.provider == CLIProvider.antigravity.rawValue &&
-        migratedGemini?.ordinal == 2 && migratedGemini?.displayName == "Antigravity CLI 2",
-        "unambiguous catalog registration changes label while preserving ID and ordinal")
-require(migratedSnapshot.migrationNotice?.contains("IDs e ordinais foram preservados") == true &&
-        migratedSnapshot.manualRegistrations.first(where: { $0.id == oldCodexID })?.provider == "CodexCLI",
+        migratedGemini?.ordinal == 0 && migratedGemini?.displayName == "Antigravity CLI 0",
+        "unambiguous catalog registration changes label while preserving ID after one-time compaction")
+require(migratedSnapshot.migrationNotice?.contains("IDs foram preservados") == true &&
+        migratedSnapshot.manualRegistrations.first(where: { $0.id == oldCodexID })?.ordinal == 1 &&
+        migratedSnapshot.manualRegistrations.first(where: { $0.id == olderCodexID })?.ordinal == 0,
         "successful migration is reported and other registrations remain intact")
 let migratedAdded = try legacyMigrationStore.add(provider: .antigravity).last!
-require(migratedAdded.ordinal == 5,
-        "legacy high-water prevents reusing an old automatic or manual index")
+require(migratedAdded.ordinal == 1,
+        "legacy high-water does not prevent using the smallest free ordinal")
+let migratedAgain = try legacyMigrationStore.snapshot(discoveries: noRealGemini)
+require(migratedAgain.manualRegistrations.first(where: { $0.id == oldCodexID })?.ordinal == 1 &&
+        migratedAgain.manualRegistrations.first(where: { $0.id == olderCodexID })?.ordinal == 0 &&
+        migratedAgain.manualRegistrations.first(where: { $0.id == legacyGeminiID })?.ordinal == 0,
+        "schema migration does not renumber rows on refresh")
 let migratedDocumentText = try String(contentsOf: legacyMigrationStore.fileURL, encoding: .utf8)
-require(!migratedDocumentText.contains("hiddenDiscoveries"), "legacy hidden state is removed")
+require(!migratedDocumentText.contains("hiddenDiscoveries") && migratedDocumentText.contains("schemaVersion"),
+        "one-time schema version persists and legacy hidden state is removed")
 
 // A real Gemini executable blocks conversion and leaves the complete legacy record intact.
 let preserveLegacyStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("preserve-gemini"))
@@ -177,8 +201,8 @@ require(collisionSnapshot.manualRegistrations.contains(where: {
 }) && collisionSnapshot.migrationNotice != nil,
         "ordinal collision keeps the legacy provider and asks for a decision")
 let nextAfterCollision = try collisionStore.add(provider: .antigravity).last
-require(nextAfterCollision?.ordinal == 2,
-        "future Antigravity registration avoids ordinal collision")
+require(nextAfterCollision?.ordinal == 0,
+        "future Antigravity registration uses the smallest unoccupied ordinal")
 
 // Historical automatic Gemini rows migrate into their own discovery identity, never AGY.
 let automaticMigrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("automatic-gemini"))
