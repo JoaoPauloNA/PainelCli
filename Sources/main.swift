@@ -86,9 +86,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var installationFailures: [UUID: String] = [:]
     private var authenticationStates: [UUID: CLIAuthenticationUIState] = [:]
     private var authenticationProcesses: [UUID: Process] = [:]
-    private var authenticationHandoffs: [UUID: CLIDeviceCodeHandoff] = [:]
     private var checkingAuthenticationIDs = Set<UUID>()
     private var cancelledAuthenticationIDs = Set<UUID>()
+    private var activeLogoutIDs = Set<UUID>()
     private var listItems: [CLIListItem] {
         automaticInstallations.map(CLIListItem.detected) + entries.map(CLIListItem.manual)
     }
@@ -307,14 +307,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Presentation only. The caller owns availability, target/action, and isolated-install rules.
     private func makeInstallButton(displayName: String, tag: Int) -> NSButton {
-        let button = NSButton(title: "Instalar",
-                              image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil) ?? NSImage(),
+        let button = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle",
+                                             accessibilityDescription: "Instalar \(displayName)") ?? NSImage(),
                               target: nil, action: nil)
-        button.bezelStyle = .rounded
+        button.bezelStyle = .inline
+        button.isBordered = false
         button.controlSize = .small
-        button.font = .systemFont(ofSize: 12, weight: .medium)
-        button.imagePosition = .imageLeading
-        button.imageHugsTitle = true
         button.tag = tag
         button.setAccessibilityLabel("Instalar \(displayName)")
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -461,18 +459,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     authenticationProcesses[$0.id]?.isRunning == true
                 } ?? false
                 let canStartLogin = codexRegistration.map { canStartAuthentication(for: $0) } ?? false
+                let installState = codexRegistration.map { registrationInstallState(for: $0) }
+                let isAuthenticated = authState == .authenticated
                 account.target = self
-                account.action = #selector(loginCLI(_:))
-                account.isEnabled = !storageLoadFailed && (canStartLogin || canCancelLogin)
+                account.action = isAuthenticated ? #selector(logoutCLI(_:)) : #selector(loginCLI(_:))
+                account.isEnabled = !storageLoadFailed &&
+                    (canCancelLogin || (installState == .installed && (isAuthenticated || canStartLogin)))
                 account.contentTintColor = account.isEnabled ? .controlAccentColor : .disabledControlTextColor
                 if canCancelLogin {
                     account.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "Cancelar login")
                     account.toolTip = "Cancelar login deste cadastro"
                     account.setAccessibilityLabel("Cancelar login de \(entry.displayName)")
+                } else if isAuthenticated {
+                    account.image = NSImage(systemSymbolName: "rectangle.portrait.and.arrow.right",
+                                            accessibilityDescription: "Sair")
+                    account.toolTip = "Sair deste cadastro e limpar as credenciais locais. Isso não revoga a sessão remotamente."
+                    account.setAccessibilityLabel("Sair de \(entry.displayName)")
+                } else if case .statusError = authState {
+                    account.image = NSImage(systemSymbolName: "exclamationmark.circle",
+                                            accessibilityDescription: "Estado do login indeterminado")
+                    account.toolTip = "Não foi possível confirmar o estado do login. Atualize a verificação antes de entrar ou sair."
+                    account.setAccessibilityLabel("Estado do login indeterminado em \(entry.displayName)")
+                } else if installState != .installed {
+                    account.toolTip = "Instale este cadastro para verificar ou alterar seu login; dados locais existentes são preservados."
+                    account.setAccessibilityLabel("Login indisponível enquanto \(entry.displayName) não está instalado")
                 } else {
                     account.toolTip = codexRegistration == nil
                         ? "Login disponível somente para um Codex instalado neste cadastro"
-                        : "Login normal pelo navegador; use Código para selecionar a alternativa de device-code"
+                        : "Entrar pelo navegador neste cadastro"
                     account.setAccessibilityLabel(codexRegistration == nil
                         ? "Login indisponível para \(entry.displayName)"
                         : "Entrar pelo navegador em \(entry.displayName)")
@@ -482,17 +496,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 actions.addArrangedSubview(account)
                 account.widthAnchor.constraint(equalToConstant: 28).isActive = true
                 account.heightAnchor.constraint(equalToConstant: 28).isActive = true
-                if codexRegistration != nil {
-                    let deviceCode = NSButton(title: "Código", target: self,
-                                              action: #selector(loginCLIWithDeviceCode(_:)))
-                    deviceCode.bezelStyle = .rounded
-                    deviceCode.tag = index
-                    deviceCode.isEnabled = !storageLoadFailed && canStartLogin
-                    deviceCode.toolTip = "Usar explicitamente o login por código de dispositivo neste cadastro"
-                    deviceCode.setAccessibilityLabel("Entrar com código de dispositivo em \(entry.displayName)")
-                    actions.addArrangedSubview(deviceCode)
-                }
-
                 let remove = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
                                       target: self, action: #selector(removeCLI(_:)))
                 remove.bezelStyle = .inline
@@ -501,6 +504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 remove.isEnabled = isManualEntry && !storageLoadFailed &&
                     entry.manualEntry.map {
                         !installingRegistrationIDs.contains($0.id) &&
+                        !activeLogoutIDs.contains($0.id) &&
                         authenticationProcesses[$0.id]?.isRunning != true
                     } == true
                 remove.contentTintColor = remove.isEnabled ? .systemRed : .disabledControlTextColor
@@ -525,16 +529,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                    manualEntry.provider == CLIProvider.codex.rawValue {
                     let install = makeInstallButton(displayName: entry.displayName, tag: index)
                     let state = registrationInstallState(for: manualEntry)
+                    let isInstalled = state == .installed
+                    let actionSymbol: String
+                    if isInstalled {
+                        actionSymbol = "trash"
+                    } else if state == .incomplete {
+                        actionSymbol = "exclamationmark.triangle"
+                    } else {
+                        actionSymbol = "arrow.down.circle"
+                    }
+                    install.image = NSImage(systemSymbolName: actionSymbol,
+                                            accessibilityDescription: isInstalled ? "Desinstalar" : "Instalar")
                     install.target = self
-                    install.action = #selector(installCLI(_:))
-                    install.isEnabled = canInstall(manualEntry)
+                    install.action = isInstalled ? #selector(uninstallCLI(_:)) : #selector(installCLI(_:))
+                    install.isEnabled = !storageLoadFailed && (isInstalled
+                        ? canUninstall(manualEntry)
+                        : canInstall(manualEntry))
                     install.contentTintColor = install.isEnabled ? .controlAccentColor : .disabledControlTextColor
-                    install.toolTip = state.displayText
-                    install.setAccessibilityLabel("Instalar \(entry.displayName)")
+                    install.toolTip = isInstalled
+                        ? "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados; isso não encerra a sessão."
+                        : state.displayText
+                    install.setAccessibilityLabel(isInstalled
+                        ? "Desinstalar Codex gerenciado de \(entry.displayName)"
+                        : "Instalar Codex em \(entry.displayName)")
                     install.setAccessibilityValue(state.displayText)
                     install.translatesAutoresizingMaskIntoConstraints = false
                     actions.insertArrangedSubview(install, at: 0)
-                    install.widthAnchor.constraint(greaterThanOrEqualToConstant: 92).isActive = true
+                    install.widthAnchor.constraint(equalToConstant: 28).isActive = true
                     install.heightAnchor.constraint(equalToConstant: 28).isActive = true
                 }
                 let separator = NSBox()
@@ -603,29 +624,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               authenticationProcesses[entry.id]?.isRunning != true else { return false }
         switch authenticationUIState(for: entry) {
         case .notAuthenticated, .failed, .cancelled: return true
-        case .checking, .starting, .awaitingBrowserAuthorization, .awaitingUserCode, .authenticated: return false
+        case .checking, .starting, .awaitingBrowserAuthorization, .loggingOut, .authenticated, .statusError: return false
         }
     }
 
     private func isAuthenticationRunningState(_ state: CLIAuthenticationUIState) -> Bool {
         switch state {
-        case .starting, .awaitingBrowserAuthorization, .awaitingUserCode: return true
-        case .checking, .notAuthenticated, .authenticated, .failed, .cancelled: return false
+        case .starting, .awaitingBrowserAuthorization, .loggingOut: return true
+        case .checking, .notAuthenticated, .authenticated, .failed, .statusError, .cancelled: return false
         }
     }
 
     private func registrationInstallState(for entry: CLIEntry) -> CLIRegistrationInstallStatus {
         if installingRegistrationIDs.contains(entry.id) { return .installing }
-        if let message = installationFailures[entry.id] { return .failed(message) }
-        return installService?.registrationInstallStatus(for: entry) ?? .unsupported
+        let actual = installService?.registrationInstallStatus(for: entry) ?? .unsupported
+        if actual == .notInstalled, let message = installationFailures[entry.id] { return .failed(message) }
+        return actual
     }
 
     private func canInstall(_ entry: CLIEntry) -> Bool {
         guard !storageLoadFailed,
               entry.provider == CLIProvider.codex.rawValue,
               installService != nil,
-              !installingRegistrationIDs.contains(entry.id) else { return false }
+              !installingRegistrationIDs.contains(entry.id),
+              !activeLogoutIDs.contains(entry.id) else { return false }
         return registrationInstallState(for: entry).canInstall
+    }
+
+    private func canUninstall(_ entry: CLIEntry) -> Bool {
+        guard !storageLoadFailed, entry.provider == CLIProvider.codex.rawValue,
+              !installingRegistrationIDs.contains(entry.id),
+              !activeLogoutIDs.contains(entry.id),
+              !checkingAuthenticationIDs.contains(entry.id),
+              authenticationProcesses[entry.id]?.isRunning != true else { return false }
+        return registrationInstallState(for: entry) == .installed
     }
 
     private func displayLocation(_ executable: URL) -> String {
@@ -664,9 +696,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     case .notAuthenticated: state = .notAuthenticated
                     }
                 } catch let error as CLIInstallError {
-                    state = .failed(error.errorDescription ?? "Não foi possível verificar o login.")
+                    state = .statusError(error.errorDescription ?? "Não foi possível verificar o login.")
                 } catch {
-                    state = .failed("Não foi possível verificar o login isolado.")
+                    state = .statusError("Não foi possível verificar o login isolado.")
                 }
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -729,14 +761,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func loginCLI(_ sender: NSButton) {
-        loginCLI(sender, mode: .browser)
-    }
-
-    @objc private func loginCLIWithDeviceCode(_ sender: NSButton) {
-        loginCLI(sender, mode: .deviceCode)
-    }
-
-    private func loginCLI(_ sender: NSButton, mode: CLIAuthenticationMode) {
         guard !storageLoadFailed, let service = installService,
               listItems.indices.contains(sender.tag),
               let entry = listItems[sender.tag].manualEntry,
@@ -746,7 +770,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isAuthenticationRunningState(authenticationStates[entry.id] ?? .notAuthenticated),
            let process = authenticationProcesses[entry.id], process.isRunning {
             cancelledAuthenticationIDs.insert(entry.id)
-            authenticationHandoffs[entry.id]?.cancel()
             authenticationStates[entry.id] = .cancelled
             process.terminate()
             render(.settings)
@@ -754,14 +777,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard canStartAuthentication(for: entry) else { return }
         cancelledAuthenticationIDs.remove(entry.id)
-        let handoff = CLIDeviceCodeHandoff()
-        authenticationHandoffs[entry.id] = handoff
         authenticationStates[entry.id] = .starting
         render(.settings)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let session = try service.startAuthentication(for: entry, mode: mode)
+                let session = try service.startAuthentication(for: entry)
                 let process = session.process
                 DispatchQueue.main.async {
                     guard let self else { process.terminate(); return }
@@ -771,7 +792,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 var loginRequestSent = false
                 var browserHandoffHandled = false
-                var deviceCodeReceived = false
                 var loginCompletedSuccessfully = false
                 var activeLoginID: String?
                 var appServerRequestFailed = false
@@ -799,10 +819,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     session.input.fileHandleForWriting.write(
                                         CLIAppServerLoginProtocol.notification(method: "initialized") ?? Data())
                                     session.input.fileHandleForWriting.write(
-                                        CLIAppServerLoginProtocol.startRequest(mode: mode) ?? Data())
+                                        CLIAppServerLoginProtocol.startRequest() ?? Data())
                                     loginRequestSent = true
                                 }
-                            } else if responseID == 2, mode == .browser,
+                            } else if responseID == 2,
                                       !browserHandoffHandled,
                                       let authURL = CLIAppServerLoginProtocol.authURL(from: message) {
                                 browserHandoffHandled = true
@@ -814,26 +834,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                                                            authURL: authURL)) == true
                                     guard let self else { return }
                                     self.authenticationStates[entry.id] = .awaitingBrowserAuthorization(pageOpened: opened)
-                                    if self.settingsButton.state == .on { self.render(.settings) }
-                                }
-                            } else if responseID == 2, mode == .deviceCode,
-                                      let prompt = CLIAppServerLoginProtocol.devicePrompt(from: message) {
-                                activeLoginID = CLIAppServerLoginProtocol.loginID(from: message)
-                                var result: CLIDeviceCodeHandoffResult?
-                                DispatchQueue.main.sync {
-                                    result = handoff.handle(prompt: prompt,
-                                                            processIsRunning: process.isRunning,
-                                                            copyCode: self?.writeDeviceCodeToClipboard ?? { _ in false },
-                                                            openPage: { url in
-                                                                (try? service.openDeviceAuthenticationPage(
-                                                                    for: entry, verificationURL: url)) == true
-                                                            })
-                                    guard let self, let result else { return }
-                                    deviceCodeReceived = true
-                                    self.authenticationStates[entry.id] = .awaitingUserCode(
-                                        prompt.code,
-                                        clipboardCopied: result.clipboardCopied,
-                                        pageOpened: result.pageOpened)
                                     if self.settingsButton.state == .on { self.render(.settings) }
                                 }
                             } else if (responseID == 1 || responseID == 2), message["error"] != nil {
@@ -854,22 +854,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 process.waitUntilExit()
                 readerFinished.wait()
-                let authenticated = (try? service.authenticationStatus(for: entry)) == .authenticated
+                let verifiedAuthenticationStatus: Result<CLIAuthenticationStatus, Error>
+                do { verifiedAuthenticationStatus = .success(try service.authenticationStatus(for: entry)) }
+                catch { verifiedAuthenticationStatus = .failure(error) }
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.authenticationProcesses.removeValue(forKey: entry.id)
-                    self.authenticationHandoffs.removeValue(forKey: entry.id)
-                    if authenticated {
+                    if case .failure = verifiedAuthenticationStatus {
+                        self.authenticationStates[entry.id] = .statusError(
+                            "O estado do login não pôde ser confirmado após o fluxo do navegador.")
+                    } else if case .success(.authenticated) = verifiedAuthenticationStatus {
                         self.authenticationStates[entry.id] = .authenticated
                     } else if self.cancelledAuthenticationIDs.remove(entry.id) != nil {
                         self.authenticationStates[entry.id] = .cancelled
-                    } else if mode == .browser && !browserHandoffHandled {
-                        self.authenticationStates[entry.id] = .failed("A CLI não iniciou o login normal pelo navegador. Tente novamente ou escolha Código explicitamente.")
-                    } else if mode == .deviceCode && !deviceCodeReceived {
-                        self.authenticationStates[entry.id] = .failed("A CLI não disponibilizou o código de dispositivo. O login normal pelo navegador continua disponível.")
+                    } else if !browserHandoffHandled {
+                        self.authenticationStates[entry.id] = .failed("A CLI não iniciou o login normal pelo navegador. Tente novamente.")
                     } else if !loginCompletedSuccessfully {
                         self.authenticationStates[entry.id] = .failed(appServerRequestFailed
-                            ? "A CLI não aceitou o pedido de autenticação. Tente novamente ou escolha Código."
+                            ? "A CLI não aceitou o pedido de autenticação. Tente novamente."
                             : "A autorização não foi confirmada pela CLI.")
                     } else if process.terminationStatus == 0 {
                         self.authenticationStates[entry.id] = .failed("A CLI encerrou sem confirmar a autenticação.")
@@ -894,10 +896,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func writeDeviceCodeToClipboard(_ code: String) -> Bool {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        return pasteboard.setString(code, forType: .string)
+    @objc private func logoutCLI(_ sender: NSButton) {
+        guard !storageLoadFailed, let service = installService,
+              listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry,
+              authenticationUIState(for: entry) == .authenticated,
+              registrationInstallState(for: entry) == .installed,
+              !installingRegistrationIDs.contains(entry.id),
+              !checkingAuthenticationIDs.contains(entry.id),
+              authenticationProcesses[entry.id]?.isRunning != true else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Sair deste cadastro?"
+        alert.informativeText = "A CLI vai limpar as credenciais locais deste cadastro (CODEX_HOME). Isso não revoga a sessão remotamente."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Sair")
+        alert.addButton(withTitle: "Cancelar")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        activeLogoutIDs.insert(entry.id)
+        authenticationStates[entry.id] = .loggingOut
+        render(.settings)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<CLIAuthenticationStatus, Error>
+            do { result = .success(try service.logout(for: entry)) }
+            catch { result = .failure(error) }
+            let verifiedStatus = try? service.authenticationStatus(for: entry)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.activeLogoutIDs.remove(entry.id)
+                switch verifiedStatus {
+                case .authenticated?: self.authenticationStates[entry.id] = .authenticated
+                case .notAuthenticated?: self.authenticationStates[entry.id] = .notAuthenticated
+                case nil: self.authenticationStates[entry.id] = .statusError(
+                    "A saída não pôde ser confirmada. O estado das credenciais é indeterminado.")
+                }
+                if case .failure = result {
+                    self.showStoreFailure("A CLI não confirmou a saída deste cadastro. O estado exibido vem de uma nova verificação isolada.")
+                }
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
+        }
+    }
+
+    @objc private func uninstallCLI(_ sender: NSButton) {
+        guard !storageLoadFailed, let service = installService,
+              listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry,
+              canUninstall(entry), !activeLogoutIDs.contains(entry.id) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Desinstalar o Codex deste cadastro?"
+        alert.informativeText = "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados. Esta ação não encerra nem revoga uma sessão."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Desinstalar")
+        alert.addButton(withTitle: "Cancelar")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        installingRegistrationIDs.insert(entry.id)
+        render(.settings)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<Void, Error>
+            do { try service.uninstall(entry: entry); result = .success(()) }
+            catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.installingRegistrationIDs.remove(entry.id)
+                switch result {
+                case .success:
+                    self.installationFailures.removeValue(forKey: entry.id)
+                    self.authenticationStates[entry.id] = .statusError(
+                        "Credenciais locais preservadas; reinstale para verificar ou sair.")
+                case .failure:
+                    self.showStoreFailure("O pacote deste cadastro não foi removido integralmente. Verifique o estado antes de repetir a ação.")
+                }
+                self.refreshCLIEntries()
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
+        }
     }
 
     private func showStoreFailure(_ message: String) {

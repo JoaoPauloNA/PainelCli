@@ -88,12 +88,14 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case npmUnavailable
     case nodeUnavailable
     case alreadyInstalled
+    case notInstalled
     case installationInProgress
     case incompleteInstallation
     case commandFailed(Int32)
     case commandTimedOut
     case authenticationPolicyBlocked
     case authenticationStorageUnavailable
+    case logoutNotConfirmed
     case browserUnavailable
 
     var errorDescription: String? {
@@ -106,6 +108,8 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "Não encontrei o Node.js no PATH deste app; o npm não pode iniciar sem ele."
         case .alreadyInstalled:
             return "Este cadastro já possui uma instalação isolada."
+        case .notInstalled:
+            return "Este cadastro não possui uma instalação isolada para remover."
         case .installationInProgress:
             return "A instalação deste cadastro já está em andamento."
         case .incompleteInstallation:
@@ -118,6 +122,8 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "A política local não confirma armazenamento de credenciais isolado em arquivo; login bloqueado."
         case .authenticationStorageUnavailable:
             return "O login não pôde ser confirmado no arquivo privado deste cadastro."
+        case .logoutNotConfirmed:
+            return "A CLI não confirmou a saída deste cadastro; o estado do login continua indeterminado."
         case .browserUnavailable:
             return "Não encontrei o Safari para abrir o fluxo oficial de login."
         }
@@ -134,9 +140,10 @@ enum CLIAuthenticationUIState: Equatable {
     case notAuthenticated
     case starting
     case awaitingBrowserAuthorization(pageOpened: Bool)
-    case awaitingUserCode(String, clipboardCopied: Bool, pageOpened: Bool)
+    case loggingOut
     case authenticated
     case failed(String)
+    case statusError(String)
     case cancelled
 
     var displayText: String {
@@ -144,19 +151,14 @@ enum CLIAuthenticationUIState: Equatable {
         case .checking: return "Verificando login isolado…"
         case .notAuthenticated: return "Login não configurado neste cadastro"
         case .starting: return "Iniciando login isolado…"
+        case .loggingOut: return "Saindo deste cadastro…"
         case .awaitingBrowserAuthorization(let opened):
             return opened
                 ? "Safari aberto. Conclua o login e a autorização."
-                : "Safari não abriu. Cancele e escolha Código para tentar a alternativa."
-        case .awaitingUserCode(let code, let clipboardCopied, let pageOpened):
-            switch (clipboardCopied, pageOpened) {
-            case (true, true): return "Código copiado. No Safari, cole e confirme: \(code)"
-            case (false, true): return "Falha ao copiar. Digite o código no Safari: \(code)"
-            case (true, false): return "Código copiado. Abra a página oficial e cole: \(code)"
-            case (false, false): return "Falha ao copiar e abrir a página. Digite o código manualmente: \(code)"
-            }
+                : "Safari não abriu. Tente novamente para iniciar o login pelo navegador."
         case .authenticated: return "Autenticado neste cadastro"
         case .failed(let message): return "Falha no login isolado · \(message)"
+        case .statusError(let message): return "Estado do login indeterminado · \(message)"
         case .cancelled: return "Login isolado cancelado"
         }
     }
@@ -192,18 +194,6 @@ enum CLIRegistrationInstallStatus: Equatable {
 typealias CLICommandRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Int32
 typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ input: Pipe, _ output: Pipe) throws -> Process
 
-enum CLIAuthenticationMode: Equatable {
-    case browser
-    case deviceCode
-
-    var appServerLoginType: String {
-        switch self {
-        case .browser: return "chatgpt"
-        case .deviceCode: return "chatgptDeviceCode"
-        }
-    }
-}
-
 struct CLIAuthenticationSession {
     let process: Process
     let input: Pipe
@@ -221,13 +211,13 @@ enum CLIAppServerLoginProtocol {
         return encode(value)
     }
 
-    static func startRequest(mode: CLIAuthenticationMode) -> Data? {
-        message(id: 2, method: "account/login/start", params: ["type": mode.appServerLoginType])
+    static func startRequest() -> Data? {
+        message(id: 2, method: "account/login/start", params: ["type": "chatgpt"])
     }
 
     static func authURL(from response: [String: Any]) -> URL? {
         guard let result = response["result"] as? [String: Any],
-              result["type"] as? String == CLIAuthenticationMode.browser.appServerLoginType,
+              result["type"] as? String == "chatgpt",
               let raw = result["authUrl"] as? String,
               let url = URL(string: raw), url.scheme == "https", url.host == "auth.openai.com" else { return nil }
         return url
@@ -237,57 +227,10 @@ enum CLIAppServerLoginProtocol {
         (response["result"] as? [String: Any])?["loginId"] as? String
     }
 
-    static func devicePrompt(from response: [String: Any]) -> CLIDeviceCodePrompt? {
-        guard let result = response["result"] as? [String: Any],
-              result["type"] as? String == CLIAuthenticationMode.deviceCode.appServerLoginType,
-              let rawURL = result["verificationUrl"] as? String,
-              let url = URL(string: rawURL), url.scheme == "https",
-              url.host == "auth.openai.com", url.path == "/codex/device",
-              let code = result["userCode"] as? String, !code.isEmpty else { return nil }
-        return CLIDeviceCodePrompt(verificationURL: url, code: code)
-    }
-
     private static func encode(_ object: [String: Any]) -> Data? {
         guard var data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
         data.append(0x0A)
         return data
-    }
-}
-
-struct CLIDeviceCodePrompt: Equatable {
-    let verificationURL: URL
-    let code: String
-}
-
-struct CLIDeviceCodeHandoffResult: Equatable {
-    let clipboardCopied: Bool
-    let pageOpened: Bool
-}
-
-/// Claims one active CLI prompt and copies its code before handing the page to Safari.
-/// The app invokes this on the main queue so cancellation and UI handoff are serialized.
-final class CLIDeviceCodeHandoff {
-    private let lock = NSLock()
-    private var cancelled = false
-    private var handledPrompt = false
-
-    func cancel() {
-        lock.lock()
-        cancelled = true
-        lock.unlock()
-    }
-
-    func handle(prompt: CLIDeviceCodePrompt,
-                processIsRunning: Bool,
-                copyCode: (String) -> Bool,
-                openPage: (URL) -> Bool) -> CLIDeviceCodeHandoffResult? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !cancelled, !handledPrompt, processIsRunning else { return nil }
-        handledPrompt = true
-        let copied = copyCode(prompt.code)
-        let opened = openPage(prompt.verificationURL)
-        return CLIDeviceCodeHandoffResult(clipboardCopied: copied, pageOpened: opened)
     }
 }
 
@@ -385,7 +328,9 @@ struct CLIInstallService {
         let root = installationRoot(for: entry)
         guard fileManager.fileExists(atPath: root.appendingPathComponent("install.json").path) else {
             let contents = (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? []
-            return contents.contains(where: { $0.hasPrefix(".stage-") }) ? .incomplete : .notInstalled
+            let hasPackage = fileManager.fileExists(atPath: root.appendingPathComponent("package").path)
+            return contents.contains(where: { $0.hasPrefix(".stage-") }) || hasPackage
+                ? .incomplete : .notInstalled
         }
         guard let data = try? Data(contentsOf: root.appendingPathComponent("install.json")),
               let manifest = try? JSONDecoder().decode(InstallManifest.self, from: data),
@@ -426,14 +371,8 @@ struct CLIInstallService {
         let registrationDirectory = registrationDirectory(for: entry)
         try fileManager.createDirectory(at: registrationDirectory, withIntermediateDirectories: true)
         try setPrivatePermissions(registrationDirectory)
-
-        let lockURL = registrationDirectory.appendingPathComponent(".install.lock")
-        let lockDescriptor = open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-        guard lockDescriptor >= 0 else { throw CLIInstallError.installationInProgress }
-        defer { _ = flock(lockDescriptor, LOCK_UN); _ = close(lockDescriptor) }
-        guard flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0 else {
-            throw CLIInstallError.installationInProgress
-        }
+        let lockDescriptor = try acquireRegistrationLock(for: entry)
+        defer { releaseRegistrationLock(lockDescriptor) }
 
         // Re-check after acquiring the per-UUID lock so concurrent clicks cannot duplicate work.
         switch registrationInstallStatus(for: entry) {
@@ -447,9 +386,6 @@ struct CLIInstallService {
         let stage = registrationDirectory.appendingPathComponent(".stage-\(UUID().uuidString)",
                                                                  isDirectory: true)
         let finalRoot = installationRoot(for: entry)
-        guard !fileManager.fileExists(atPath: finalRoot.path) else {
-            throw CLIInstallError.incompleteInstallation
-        }
         try fileManager.createDirectory(at: stage, withIntermediateDirectories: false)
         try setPrivatePermissions(stage)
         var published = false
@@ -466,6 +402,9 @@ struct CLIInstallService {
         let xdg = stage.appendingPathComponent("xdg", isDirectory: true)
         let npmUserConfig = stage.appendingPathComponent("npm-user.npmrc")
         let npmGlobalConfig = stage.appendingPathComponent("npm-global.npmrc")
+        if fileManager.fileExists(atPath: finalRoot.path) {
+            try copyRetainedRegistrationData(from: finalRoot, to: stage)
+        }
         for directory in [packagePrefix, codexHome, npmHome, npmCache, tempDirectory,
                           runtimeHome,
                           xdg.appendingPathComponent("config", isDirectory: true),
@@ -475,8 +414,12 @@ struct CLIInstallService {
             try setPrivatePermissions(directory)
         }
 
-        try Data().write(to: npmUserConfig, options: .atomic)
-        try Data().write(to: npmGlobalConfig, options: .atomic)
+        if !fileManager.fileExists(atPath: npmUserConfig.path) {
+            try Data().write(to: npmUserConfig, options: .atomic)
+        }
+        if !fileManager.fileExists(atPath: npmGlobalConfig.path) {
+            try Data().write(to: npmGlobalConfig, options: .atomic)
+        }
         try setPrivatePermissions(npmUserConfig, mode: 0o600)
         try setPrivatePermissions(npmGlobalConfig, mode: 0o600)
 
@@ -499,17 +442,55 @@ struct CLIInstallService {
         }
         // Reassert the isolated credential backend after package lifecycle scripts finish.
         let config = codexHome.appendingPathComponent("config.toml")
-        try Data("cli_auth_credentials_store = \"file\"\n".utf8).write(to: config, options: .atomic)
+        try enforceFileCredentialStore(in: config)
         try setPrivatePermissions(config, mode: 0o600)
+        let retainedAuthFile = codexHome.appendingPathComponent("auth.json")
+        if fileManager.fileExists(atPath: retainedAuthFile.path) {
+            try setPrivatePermissions(retainedAuthFile, mode: 0o600)
+        }
         let manifest = InstallManifest(registrationID: entry.id, provider: entry.provider,
                                        package: "@openai/codex@latest",
                                        executableRelativePath: Self.codexExecutableRelativePath)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(to: stage.appendingPathComponent("install.json"), options: .atomic)
-        try fileManager.moveItem(at: stage, to: finalRoot)
+        let backupRoot = registrationDirectory.appendingPathComponent(".uninstalled-\(UUID().uuidString)",
+                                                                      isDirectory: true)
+        let hasRetainedRoot = fileManager.fileExists(atPath: finalRoot.path)
+        if hasRetainedRoot { try fileManager.moveItem(at: finalRoot, to: backupRoot) }
+        do {
+            try fileManager.moveItem(at: stage, to: finalRoot)
+        } catch {
+            if hasRetainedRoot, fileManager.fileExists(atPath: backupRoot.path) {
+                try? fileManager.moveItem(at: backupRoot, to: finalRoot)
+            }
+            throw error
+        }
+        if hasRetainedRoot { try fileManager.removeItem(at: backupRoot) }
         published = true
         return finalRoot.appendingPathComponent(Self.codexExecutableRelativePath)
+    }
+
+    /// Removes only the package and its manifest for one installed UUID. Runtime data,
+    /// including auth.json, config, history, and caches, remains available for reinstall.
+    func uninstall(entry: CLIEntry) throws {
+        guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
+        let lockDescriptor = try acquireRegistrationLock(for: entry)
+        defer { releaseRegistrationLock(lockDescriptor) }
+        guard registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let root = installationRoot(for: entry)
+        let package = root.appendingPathComponent("package", isDirectory: true)
+        let manifest = root.appendingPathComponent("install.json")
+        guard isRealDirectory(root), isRealDirectory(package), isRegularFile(manifest) else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        try fileManager.removeItem(at: package)
+        try fileManager.removeItem(at: manifest)
+        guard registrationInstallStatus(for: entry) == .notInstalled else {
+            throw CLIInstallError.incompleteInstallation
+        }
     }
 
     /// Runtime variables are assembled from an allowlist. This keeps HOME, CODEX_HOME,
@@ -563,10 +544,28 @@ struct CLIInstallService {
         return .authenticated
     }
 
+    /// Clears only the Codex credentials selected by this registration's CODEX_HOME,
+    /// then requires the same isolated CLI to confirm that it is signed out.
+    func logout(for entry: CLIEntry) throws -> CLIAuthenticationStatus {
+        guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
+        let lockDescriptor = try acquireRegistrationLock(for: entry)
+        defer { releaseRegistrationLock(lockDescriptor) }
+        guard registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let before = try authenticationStatus(for: entry)
+        guard before == .authenticated else { return .notAuthenticated }
+        let exitCode = try processRunner(managedExecutableURL(for: entry), ["logout"],
+                                         isolatedRuntimeEnvironment(for: entry))
+        guard exitCode == 0 else { throw CLIInstallError.commandFailed(exitCode) }
+        let after = try authenticationStatus(for: entry)
+        guard after == .notAuthenticated else { throw CLIInstallError.logoutNotConfirmed }
+        return after
+    }
+
     /// Starts the official CLI app-server with this registration's isolated environment.
-    /// Browser and device-code login are distinct, explicit account/login/start requests.
-    func startAuthentication(for entry: CLIEntry,
-                             mode: CLIAuthenticationMode = .browser) throws -> CLIAuthenticationSession {
+    /// Starts the browser OAuth flow through the official Codex app-server.
+    func startAuthentication(for entry: CLIEntry) throws -> CLIAuthenticationSession {
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
         }
@@ -597,16 +596,6 @@ struct CLIInstallService {
         return try openSafari(authURL)
     }
 
-    func openDeviceAuthenticationPage(for entry: CLIEntry, verificationURL: URL) throws -> Bool {
-        guard verificationURL.scheme == "https",
-              verificationURL.host == "auth.openai.com",
-              verificationURL.path == "/codex/device",
-              fileManager.fileExists(atPath: Self.safariExecutablePath) else {
-            throw CLIInstallError.browserUnavailable
-        }
-        return try openSafari(verificationURL)
-    }
-
     private func openSafari(_ url: URL) throws -> Bool {
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -618,18 +607,6 @@ struct CLIInstallService {
         try open.run()
         open.waitUntilExit()
         return open.terminationStatus == 0
-    }
-
-    static func deviceCodePrompt(in output: String) -> CLIDeviceCodePrompt? {
-        let clean = output.replacingOccurrences(of: "\u{001B}\\[[0-9;]*m", with: "", options: .regularExpression)
-        let lines = clean.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard lines.contains("https://auth.openai.com/codex/device"),
-              let marker = lines.firstIndex(where: { $0.contains("Enter this one-time code") }),
-              marker + 1 < lines.count else { return nil }
-        let code = lines[(marker + 1)...].first(where: { !$0.isEmpty }) ?? ""
-        guard code.range(of: "^[A-Z0-9-]{6,24}$", options: .regularExpression) != nil,
-              let url = URL(string: "https://auth.openai.com/codex/device") else { return nil }
-        return CLIDeviceCodePrompt(verificationURL: url, code: code)
     }
 
     /// Admin-enforced credential policies outrank the instance config. Inspect only the
@@ -772,6 +749,76 @@ struct CLIInstallService {
     private func setPrivatePermissions(_ url: URL, mode: Int16 = 0o700) throws {
         try fileManager.setAttributes([.posixPermissions: NSNumber(value: mode)],
                                       ofItemAtPath: url.path)
+    }
+
+    private func acquireRegistrationLock(for entry: CLIEntry) throws -> Int32 {
+        let directory = registrationDirectory(for: entry)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try setPrivatePermissions(directory)
+        let url = directory.appendingPathComponent(".install.lock")
+        let descriptor = open(url.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw CLIInstallError.installationInProgress }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            _ = close(descriptor)
+            throw CLIInstallError.installationInProgress
+        }
+        return descriptor
+    }
+
+    private func releaseRegistrationLock(_ descriptor: Int32) {
+        _ = flock(descriptor, LOCK_UN)
+        _ = close(descriptor)
+    }
+
+    private func copyRetainedRegistrationData(from source: URL, to destination: URL) throws {
+        guard isRealDirectory(source) else { throw CLIInstallError.incompleteInstallation }
+        for name in ["codex-home", "home", "xdg", "npm-home", "npm-cache"] {
+            let from = source.appendingPathComponent(name, isDirectory: true)
+            guard fileManager.fileExists(atPath: from.path) else { continue }
+            guard isRealDirectory(from) else { throw CLIInstallError.incompleteInstallation }
+            try fileManager.copyItem(at: from, to: destination.appendingPathComponent(name, isDirectory: true))
+        }
+        for name in ["npm-user.npmrc", "npm-global.npmrc"] {
+            let from = source.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: from.path) else { continue }
+            guard isRegularFile(from) else { throw CLIInstallError.incompleteInstallation }
+            try fileManager.copyItem(at: from, to: destination.appendingPathComponent(name))
+            try setPrivatePermissions(destination.appendingPathComponent(name), mode: 0o600)
+        }
+    }
+
+    private func enforceFileCredentialStore(in config: URL) throws {
+        let existing = (try? String(contentsOf: config, encoding: .utf8)) ?? ""
+        var lines = existing.components(separatedBy: .newlines)
+        var found = false
+        var inRootTable = true
+        for index in lines.indices {
+            let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") { inRootTable = false; continue }
+            if inRootTable,
+               trimmed.split(separator: "=", maxSplits: 1).first.map({
+                   $0.trimmingCharacters(in: .whitespaces) == "cli_auth_credentials_store"
+               }) == true {
+                lines[index] = "cli_auth_credentials_store = \"file\""
+                found = true
+            }
+        }
+        if !found {
+            let firstTable = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("[") }) ?? lines.endIndex
+            lines.insert("cli_auth_credentials_store = \"file\"", at: firstTable)
+        }
+        let content = lines.joined(separator: "\n").trimmingCharacters(in: .newlines) + "\n"
+        try Data(content.utf8).write(to: config, options: .atomic)
+    }
+
+    private func isRealDirectory(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private func isRegularFile(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
     }
 
     private func hasPrivatePermissions(_ url: URL, allowingOwnerMode: Int16) -> Bool {

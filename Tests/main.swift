@@ -249,13 +249,10 @@ require(authenticationStatusCommand?.2["CODEX_HOME"] == originalInstallDirectory
         authenticationCommand?.2["OPENAI_API_KEY"] == nil &&
         authenticationCommand?.2["NPM_TOKEN"] == nil,
         "browser login and status inherit the instance runtime environment without host credentials")
-let browserLoginRequest = CLIAppServerLoginProtocol.startRequest(mode: .browser)
-let deviceLoginRequest = CLIAppServerLoginProtocol.startRequest(mode: .deviceCode)
+let browserLoginRequest = CLIAppServerLoginProtocol.startRequest()
 let browserLoginObject = try JSONSerialization.jsonObject(with: browserLoginRequest!.dropLast()) as! [String: Any]
-let deviceLoginObject = try JSONSerialization.jsonObject(with: deviceLoginRequest!.dropLast()) as! [String: Any]
-require(((browserLoginObject["params"] as? [String: String])?["type"] == "chatgpt") &&
-        ((deviceLoginObject["params"] as? [String: String])?["type"] == "chatgptDeviceCode"),
-        "normal browser OAuth is the default request and device-code requires an explicit mode")
+require((browserLoginObject["params"] as? [String: String])?["type"] == "chatgpt",
+        "the app-server login request uses the browser OAuth route")
 let initializeRequest = CLIAppServerLoginProtocol.message(
     id: 1, method: "initialize", params: ["capabilities": ["experimentalApi": true]])!
 let initializeObject = try JSONSerialization.jsonObject(with: initializeRequest.dropLast()) as! [String: Any]
@@ -272,68 +269,6 @@ require(CLIAppServerLoginProtocol.authURL(from: authResponse)?.host == "auth.ope
 require(!CLIAuthenticationUIState.awaitingBrowserAuthorization(pageOpened: true)
             .displayText.contains("auth.openai.com"),
         "browser auth URLs are never shown in the app's visible status text")
-let deviceResponse = ["result": ["type": "chatgptDeviceCode",
-                                 "verificationUrl": "https://auth.openai.com/codex/device",
-                                 "userCode": "ABCD-EFGH"]]
-require(CLIAppServerLoginProtocol.devicePrompt(from: deviceResponse)?.code == "ABCD-EFGH",
-        "explicit device-code mode parses the typed app-server response in memory")
-let devicePrompt = """
-Welcome to Codex
-1. Open this link in your browser and sign in to your account
-https://auth.openai.com/codex/device
-2. Enter this one-time code (expires in 15 minutes)
-ABCD-EFGH
-"""
-require(CLIInstallService.deviceCodePrompt(in: devicePrompt) == CLIDeviceCodePrompt(
-            verificationURL: URL(string: "https://auth.openai.com/codex/device")!, code: "ABCD-EFGH"),
-        "official device-code output is parsed in memory into the fixed URL and user code")
-require(CLIInstallService.deviceCodePrompt(in: "https://auth.openai.com/other\nEnter this one-time code\nABCD-EFGH") == nil,
-        "unapproved device URLs are never accepted from CLI output")
-let clipboardPrompt = CLIDeviceCodePrompt(
-    verificationURL: URL(string: "https://auth.openai.com/codex/device")!, code: "ABCD-EFGH")
-let handoff = CLIDeviceCodeHandoff()
-var handoffEvents: [String] = []
-let handoffResult = handoff.handle(prompt: clipboardPrompt, processIsRunning: true,
-                                   copyCode: { code in
-                                       require(code == "ABCD-EFGH", "clipboard receives only the active synthetic device code")
-                                       handoffEvents.append("copy")
-                                       return true
-                                   },
-                                   openPage: { url in
-                                       require(url == clipboardPrompt.verificationURL,
-                                               "browser handoff uses the fixed official verification page")
-                                       handoffEvents.append("open")
-                                       return true
-                                   })
-require(handoffResult == CLIDeviceCodeHandoffResult(clipboardCopied: true, pageOpened: true) &&
-        handoffEvents == ["copy", "open"],
-        "active device code is copied once before opening Safari")
-let repeatedHandoff = handoff.handle(prompt: clipboardPrompt, processIsRunning: true,
-                                     copyCode: { _ in handoffEvents.append("duplicate-copy"); return true },
-                                     openPage: { _ in handoffEvents.append("duplicate-open"); return true })
-require(repeatedHandoff == nil && handoffEvents == ["copy", "open"],
-        "repeated output cannot copy or open the same device prompt twice")
-let cancelledHandoff = CLIDeviceCodeHandoff()
-cancelledHandoff.cancel()
-require(cancelledHandoff.handle(prompt: clipboardPrompt, processIsRunning: true,
-                                copyCode: { _ in false }, openPage: { _ in false }) == nil,
-        "cancelled login attempts never copy or open a later prompt")
-require(CLIDeviceCodeHandoff().handle(prompt: clipboardPrompt, processIsRunning: false,
-                                      copyCode: { _ in false }, openPage: { _ in false }) == nil,
-        "a prompt from an exited process is ignored")
-let failedClipboardState = CLIAuthenticationUIState.awaitingUserCode(
-    "ABCD-EFGH", clipboardCopied: false, pageOpened: true)
-require(failedClipboardState.displayText.contains("Falha ao copiar") &&
-        failedClipboardState.displayText.contains("Digite o código no Safari"),
-        "clipboard failure is explicit and retains manual recovery instructions")
-var recoveryPageOpened = false
-let failedClipboardResult = CLIDeviceCodeHandoff().handle(
-    prompt: clipboardPrompt, processIsRunning: true,
-    copyCode: { _ in false },
-    openPage: { _ in recoveryPageOpened = true; return true })
-require(failedClipboardResult == CLIDeviceCodeHandoffResult(clipboardCopied: false, pageOpened: true) &&
-        recoveryPageOpened,
-        "a clipboard failure does not block the official page or manual code recovery")
 _ = fakeAuthProcess
 require(CLIInstallService.authenticationPolicyAllowsFile(
             documents: ["cli_auth_credentials_store = \"file\"\nallowed_login_methods = [\"chatgpt\"]"],
@@ -376,6 +311,45 @@ do {
 } catch CLIInstallError.authenticationStorageUnavailable {
 }
 try fileManager.removeItem(at: syntheticAuthFile)
+
+// Logout is verified by the same UUID executable/environment before and after the command.
+let logoutAuthFile = originalInstallDirectory.appendingPathComponent("installation/codex-home/auth.json")
+try Data("synthetic-auth-only".utf8).write(to: logoutAuthFile, options: .atomic)
+try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: logoutAuthFile.path)
+var logoutAuthenticated = true
+var logoutClearsCredentials = true
+var logoutInvocations: [([String], [String: String])] = []
+let logoutService = CLIInstallService(
+    applicationSupportDirectory: testRoot.appendingPathComponent("install-support"),
+    environment: installEnvironment, homeDirectory: hostHome,
+    additionalSearchDirectories: [], knownExecutableOverrides: [:],
+    processRunner: { _, arguments, environment in
+        logoutInvocations.append((arguments, environment))
+        if arguments == ["logout"] {
+            if logoutClearsCredentials {
+                logoutAuthenticated = false
+                try? fileManager.removeItem(at: logoutAuthFile)
+            }
+            return 0
+        }
+        return logoutAuthenticated ? 0 : 1
+    })
+let verifiedLogoutResult = try logoutService.logout(for: originalRegistration)
+require(verifiedLogoutResult == .notAuthenticated &&
+        logoutInvocations.map(\.0) == [["login", "status"], ["logout"], ["login", "status"]] &&
+        logoutInvocations.allSatisfy { $0.1["CODEX_HOME"] == logoutAuthFile.deletingLastPathComponent().path },
+        "logout clears and verifies credentials through the same UUID-scoped CLI environment")
+try Data("synthetic-still-authenticated".utf8).write(to: logoutAuthFile, options: .atomic)
+try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: logoutAuthFile.path)
+logoutAuthenticated = true
+logoutClearsCredentials = false
+do {
+    _ = try logoutService.logout(for: originalRegistration)
+    fatalError("logout must fail if isolated login status still reports authenticated")
+} catch CLIInstallError.logoutNotConfirmed {
+}
+try fileManager.removeItem(at: logoutAuthFile)
+
 let isolatedRuntime = try codexInstallService.isolatedRuntimeEnvironment(for: originalRegistration)
 require(isolatedRuntime["CODEX_HOME"] == originalInstallDirectory.appendingPathComponent(
             "installation/codex-home").path &&
@@ -387,6 +361,47 @@ let originalCodexAfterFirstInstall = try Data(contentsOf: syntheticCodex)
 require(hostMarkerAfterFirstInstall == hostMarkerBefore &&
         originalCodexAfterFirstInstall == Data("synthetic executable".utf8),
         "installation leaves the original Codex executable and host CODEX_HOME untouched")
+
+// Uninstall removes only the managed package and manifest, retaining UUID data for reinstall.
+let preservedConfig = originalInstallDirectory.appendingPathComponent("installation/codex-home/config.toml")
+let retainedConfigText = "cli_auth_credentials_store = \"file\"\n# synthetic retained setting\ncustom_setting = \"keep\"\n"
+try Data(retainedConfigText.utf8).write(to: preservedConfig, options: .atomic)
+let historyDirectory = originalInstallDirectory.appendingPathComponent("installation/xdg/data/history", isDirectory: true)
+try fileManager.createDirectory(at: historyDirectory, withIntermediateDirectories: true)
+let historyFile = historyDirectory.appendingPathComponent("history.jsonl")
+try Data("synthetic history sentinel".utf8).write(to: historyFile)
+let preservedAuth = originalInstallDirectory.appendingPathComponent("installation/codex-home/auth.json")
+try Data("synthetic credential sentinel".utf8).write(to: preservedAuth)
+try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: preservedAuth.path)
+let siblingRegistration = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 99)
+_ = try codexInstallService.install(entry: siblingRegistration)
+let globalCodexBeforeUninstall = try Data(contentsOf: syntheticCodex)
+try codexInstallService.uninstall(entry: originalRegistration)
+let configAfterUninstall = try String(contentsOf: preservedConfig, encoding: .utf8)
+let historyAfterUninstall = try String(contentsOf: historyFile, encoding: .utf8)
+let authAfterUninstall = try String(contentsOf: preservedAuth, encoding: .utf8)
+let globalCodexAfterUninstall = try Data(contentsOf: syntheticCodex)
+require(codexInstallService.registrationInstallStatus(for: originalRegistration) == .notInstalled &&
+        !fileManager.fileExists(atPath: originalInstallDirectory.appendingPathComponent("installation/package").path) &&
+        configAfterUninstall == retainedConfigText &&
+        historyAfterUninstall == "synthetic history sentinel" &&
+        authAfterUninstall == "synthetic credential sentinel" &&
+        codexInstallService.registrationInstallStatus(for: siblingRegistration) == .installed &&
+        globalCodexAfterUninstall == globalCodexBeforeUninstall,
+        "uninstall removes only this UUID package, preserving its local data, a sibling UUID, and the global Codex")
+let retainedAuthMode = try fileManager.attributesOfItem(atPath: preservedAuth.path)[.posixPermissions] as? NSNumber
+require(retainedAuthMode?.intValue == 0o600,
+        "uninstall retains restrictive auth-file permissions")
+_ = try codexInstallService.install(entry: originalRegistration)
+let configAfterReinstall = try String(contentsOf: preservedConfig, encoding: .utf8)
+let historyAfterReinstall = try String(contentsOf: historyFile, encoding: .utf8)
+let authAfterReinstall = try String(contentsOf: preservedAuth, encoding: .utf8)
+require(codexInstallService.registrationInstallStatus(for: originalRegistration) == .installed &&
+        configAfterReinstall.contains("custom_setting = \"keep\"") &&
+        historyAfterReinstall == "synthetic history sentinel" &&
+        authAfterReinstall == "synthetic credential sentinel",
+        "reinstall restores the same UUID package while retaining its local data")
+try codexInstallService.uninstall(entry: siblingRegistration)
 
 // Removing a row keeps installations intact; reusing ordinal zero creates a distinct UUID path.
 let secondRegistration = try registrationStore.add(provider: .codex).last!
