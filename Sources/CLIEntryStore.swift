@@ -1,6 +1,7 @@
 import Foundation
 
 enum CLIEntryOrigin: String, Codable {
+    // Kept for decoding old documents. New stored entries are always manual.
     case manual
     case automatic
 }
@@ -13,9 +14,7 @@ struct CLIEntry: Codable, Equatable, Identifiable {
     var detectedPath: String? = nil
 
     var displayName: String { "\(provider) \(ordinal)" }
-    var statusText: String {
-        origin == .automatic ? "Encontrada automaticamente" : "Registro manual · CLI ainda não instalada"
-    }
+    var statusText: String { "Registro manual · CLI ainda não instalada" }
 
     private enum CodingKeys: String, CodingKey { case id, provider, ordinal, origin, detectedPath }
 
@@ -42,9 +41,23 @@ struct CLIEntry: Codable, Equatable, Identifiable {
         try values.encode(id, forKey: .id)
         try values.encode(provider, forKey: .provider)
         try values.encode(ordinal, forKey: .ordinal)
-        try values.encode(origin, forKey: .origin)
-        try values.encodeIfPresent(detectedPath, forKey: .detectedPath)
+        try values.encode(CLIEntryOrigin.manual, forKey: .origin)
     }
+}
+
+struct CLIAutomaticInstallation: Codable, Equatable, Identifiable {
+    let id: UUID
+    let target: CLIDiscoveryTarget
+    let executableURL: URL
+    let discoveryURL: URL
+    let isManaged: Bool
+
+    var displayName: String { target.displayName }
+}
+
+struct CLIListSnapshot: Equatable {
+    let manualRegistrations: [CLIEntry]
+    let detectedInstallations: [CLIAutomaticInstallation]
 }
 
 struct CLIEntryStore {
@@ -67,7 +80,78 @@ struct CLIEntryStore {
     }
 
     func load() throws -> [CLIEntry] {
-        try loadDocument().entries
+        try loadDocument().entries.filter { $0.origin == .manual }
+    }
+
+    /// Reconciles current disk discoveries into a separate, unnumbered presentation model.
+    /// The persisted `entries` array contains manual registrations only.
+    func snapshot(discoveries: [CLIDiscovery]) throws -> CLIListSnapshot {
+        var document = try loadDocument()
+        let migrated = Self.migrateLegacyAutomaticEntries(in: &document)
+        document.highestOrdinals = Self.manualHighWater(document.entries,
+                                                       preserving: document.highestOrdinals)
+
+        var seen = Set<String>()
+        let automatic = discoveries.sorted {
+            ($0.target.rawValue, $0.discoveryURL.path) < ($1.target.rawValue, $1.discoveryURL.path)
+        }.compactMap { discovery -> CLIAutomaticInstallation? in
+            let path = Self.normalizedPath(discovery.discoveryURL.path)
+            let key = Self.automaticKey(target: discovery.target, path: path)
+            guard seen.insert(key).inserted else { return nil }
+            let id = document.automaticIDs[key] ?? migrated[key] ?? UUID()
+            document.automaticIDs[key] = id
+            return CLIAutomaticInstallation(id: id, target: discovery.target,
+                                            executableURL: discovery.executableURL,
+                                            discoveryURL: discovery.discoveryURL,
+                                            isManaged: discovery.isManaged)
+        }
+
+        try save(document)
+        return CLIListSnapshot(manualRegistrations: document.entries,
+                               detectedInstallations: automatic)
+    }
+
+    @discardableResult
+    func add(provider: String) throws -> [CLIEntry] {
+        var document = try loadDocument()
+        _ = Self.migrateLegacyAutomaticEntries(in: &document)
+        document.entries = document.entries.filter { $0.origin == .manual }
+        document.highestOrdinals = Self.manualHighWater(document.entries,
+                                                       preserving: document.highestOrdinals)
+        let lastOrdinal = document.highestOrdinals[provider] ?? 0
+        guard lastOrdinal < Int.max else { throw StoreError.invalidEntries }
+        let nextOrdinal = lastOrdinal + 1
+        document.entries.append(CLIEntry(id: UUID(), provider: provider, ordinal: nextOrdinal))
+        document.highestOrdinals[provider] = nextOrdinal
+        try save(document)
+        return document.entries
+    }
+
+    /// Compatibility entry point for the pre-split UI. It now updates migration state only;
+    /// callers should use `snapshot(discoveries:)` to display automatic installations.
+    @discardableResult
+    func reconcile(discoveries: [CLIDetection]) throws -> [CLIEntry] {
+        var document = try loadDocument()
+        _ = Self.migrateLegacyAutomaticEntries(in: &document)
+        document.highestOrdinals = Self.manualHighWater(document.entries,
+                                                       preserving: document.highestOrdinals)
+        try save(document)
+        return document.entries
+    }
+
+    @discardableResult
+    func remove(id: UUID, suppressingDiscoveryPaths: [String] = []) throws -> [CLIEntry] {
+        var document = try loadDocument()
+        _ = Self.migrateLegacyAutomaticEntries(in: &document)
+        document.entries = document.entries.filter { $0.origin == .manual }
+        guard let index = document.entries.firstIndex(where: { $0.id == id }) else {
+            throw StoreError.entryNotFound
+        }
+        document.entries.remove(at: index)
+        // Keep the legacy argument source-compatible, but never suppress automatic discovery.
+        _ = suppressingDiscoveryPaths
+        try save(document)
+        return document.entries
     }
 
     private func loadDocument() throws -> StoreDocument {
@@ -80,100 +164,17 @@ struct CLIEntryStore {
             try Self.validate(entries)
             return StoreDocument(entries: entries,
                                  highestOrdinals: Dictionary(grouping: entries, by: \.provider)
-                                    .mapValues { $0.map(\.ordinal).max() ?? 0 },
-                                 hiddenDiscoveries: [])
+                                    .mapValues { $0.map(\.ordinal).max() ?? 0 })
         }
         let document = try JSONDecoder().decode(StoreDocument.self, from: data)
         try Self.validate(document.entries)
         for (provider, highest) in document.highestOrdinals {
-            guard !provider.isEmpty, highest >= (document.entries.filter { $0.provider == provider }.map(\.ordinal).max() ?? 0) else {
+            guard !provider.isEmpty,
+                  highest >= (document.entries.filter { $0.provider == provider }.map(\.ordinal).max() ?? 0) else {
                 throw StoreError.invalidEntries
             }
         }
         return document
-    }
-
-    @discardableResult
-    func add(provider: String) throws -> [CLIEntry] {
-        var document = try loadDocument()
-        let existing = document.entries
-        if let automaticIndex = existing.firstIndex(where: {
-            $0.provider == provider && $0.origin == .automatic
-        }) {
-            document.entries[automaticIndex].origin = .manual
-            document.entries[automaticIndex].detectedPath = nil
-            try save(document)
-            return document.entries
-        }
-        let lastOrdinal = max(document.highestOrdinals[provider] ?? 0,
-                              existing.filter { $0.provider == provider }.map(\.ordinal).max() ?? 0)
-        guard lastOrdinal < Int.max else { throw StoreError.invalidEntries }
-        let nextOrdinal = lastOrdinal + 1
-        var updated = existing
-        updated.append(CLIEntry(id: UUID(), provider: provider, ordinal: nextOrdinal))
-        var highestOrdinals = document.highestOrdinals
-        highestOrdinals[provider] = nextOrdinal
-        try save(StoreDocument(entries: updated, highestOrdinals: highestOrdinals,
-                               hiddenDiscoveries: document.hiddenDiscoveries))
-        return updated
-    }
-
-    @discardableResult
-    func reconcile(discoveries: [CLIDetection]) throws -> [CLIEntry] {
-        var document = try loadDocument()
-        let original = document
-        let currentPaths = Set(discoveries.map { Self.normalizedPath($0.discoveryURL.path) })
-        let manualProviders = Set(document.entries.filter { $0.origin == .manual }.map(\.provider))
-
-        document.entries.removeAll { entry in
-            guard entry.origin == .automatic else { return false }
-            guard let path = entry.detectedPath else { return true }
-            return !currentPaths.contains(Self.normalizedPath(path)) || manualProviders.contains(entry.provider)
-        }
-
-        let existingAutomatic = Set(document.entries.compactMap { entry -> String? in
-            guard entry.origin == .automatic, let path = entry.detectedPath else { return nil }
-            return "\(entry.provider)\u{0}\(Self.normalizedPath(path))"
-        })
-        var knownAutomatic = existingAutomatic
-        for detection in discoveries.sorted(by: {
-            ($0.provider.rawValue, $0.executableURL.path) < ($1.provider.rawValue, $1.executableURL.path)
-        }) {
-            let path = Self.normalizedPath(detection.discoveryURL.path)
-            let key = "\(detection.provider.rawValue)\u{0}\(path)"
-            guard !manualProviders.contains(detection.provider.rawValue),
-                  !document.hiddenDiscoveries.contains(path),
-                  knownAutomatic.insert(key).inserted else { continue }
-            let highest = document.highestOrdinals[detection.provider.rawValue] ?? 0
-            guard highest < Int.max else { throw StoreError.invalidEntries }
-            let ordinal = highest + 1
-            document.entries.append(CLIEntry(id: UUID(), provider: detection.provider.rawValue,
-                                             ordinal: ordinal, origin: .automatic, detectedPath: path))
-            document.highestOrdinals[detection.provider.rawValue] = ordinal
-        }
-
-        guard document != original else { return document.entries }
-        try save(document)
-        return document.entries
-    }
-
-    @discardableResult
-    func remove(id: UUID, suppressingDiscoveryPaths: [String] = []) throws -> [CLIEntry] {
-        var document = try loadDocument()
-        var updated = document.entries
-        guard let index = updated.firstIndex(where: { $0.id == id }) else {
-            throw StoreError.entryNotFound
-        }
-        let removed = updated.remove(at: index)
-        for path in suppressingDiscoveryPaths {
-            document.hiddenDiscoveries.insert(Self.normalizedPath(path))
-        }
-        if removed.origin == .automatic, let path = removed.detectedPath {
-            document.hiddenDiscoveries.insert(Self.normalizedPath(path))
-        }
-        document.entries = updated
-        try save(document)
-        return updated
     }
 
     private func save(_ document: StoreDocument) throws {
@@ -184,6 +185,34 @@ struct CLIEntryStore {
         try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(),
                                         withIntermediateDirectories: true)
         try data.write(to: fileURL, options: .atomic)
+    }
+
+    private static func migrateLegacyAutomaticEntries(in document: inout StoreDocument) -> [String: UUID] {
+        var migrated: [String: UUID] = [:]
+        var manual: [CLIEntry] = []
+        for entry in document.entries {
+            guard entry.origin == .automatic else {
+                manual.append(entry)
+                continue
+            }
+            if let path = entry.detectedPath,
+               let target = CLIDiscoveryTarget(legacyProviderName: entry.provider) {
+                let key = automaticKey(target: target, path: normalizedPath(path))
+                migrated[key] = entry.id
+                document.automaticIDs[key] = entry.id
+            }
+        }
+        document.entries = manual
+        // Legacy suppression entries are deliberately discarded during encoding.
+        return migrated
+    }
+
+    private static func manualHighWater(_ entries: [CLIEntry], preserving old: [String: Int]) -> [String: Int] {
+        var result = old
+        for entry in entries where entry.origin == .manual {
+            result[entry.provider] = max(result[entry.provider] ?? 0, entry.ordinal)
+        }
+        return result
     }
 
     private static func validate(_ entries: [CLIEntry]) throws {
@@ -206,6 +235,10 @@ struct CLIEntryStore {
         URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
+    private static func automaticKey(target: CLIDiscoveryTarget, path: String) -> String {
+        "\(target.rawValue)\u{0}\(path)"
+    }
+
     enum StoreError: Error {
         case invalidEntries
         case entryNotFound
@@ -214,28 +247,31 @@ struct CLIEntryStore {
     private struct StoreDocument: Codable, Equatable {
         var entries: [CLIEntry]
         var highestOrdinals: [String: Int]
-        var hiddenDiscoveries: Set<String>
+        var automaticIDs: [String: UUID]
 
-        private enum CodingKeys: String, CodingKey { case entries, highestOrdinals, hiddenDiscoveries }
+        private enum CodingKeys: String, CodingKey {
+            case entries, highestOrdinals, automaticIDs, hiddenDiscoveries
+        }
 
-        init(entries: [CLIEntry], highestOrdinals: [String: Int], hiddenDiscoveries: Set<String> = []) {
+        init(entries: [CLIEntry], highestOrdinals: [String: Int], automaticIDs: [String: UUID] = [:]) {
             self.entries = entries
             self.highestOrdinals = highestOrdinals
-            self.hiddenDiscoveries = hiddenDiscoveries
+            self.automaticIDs = automaticIDs
         }
 
         init(from decoder: Decoder) throws {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             entries = try values.decode([CLIEntry].self, forKey: .entries)
             highestOrdinals = try values.decode([String: Int].self, forKey: .highestOrdinals)
-            hiddenDiscoveries = try values.decodeIfPresent(Set<String>.self, forKey: .hiddenDiscoveries) ?? []
+            automaticIDs = try values.decodeIfPresent([String: UUID].self, forKey: .automaticIDs) ?? [:]
+            // `hiddenDiscoveries` is accepted for migration and intentionally never retained.
         }
 
         func encode(to encoder: Encoder) throws {
             var values = encoder.container(keyedBy: CodingKeys.self)
-            try values.encode(entries, forKey: .entries)
+            try values.encode(entries.filter { $0.origin == .manual }, forKey: .entries)
             try values.encode(highestOrdinals, forKey: .highestOrdinals)
-            try values.encode(hiddenDiscoveries, forKey: .hiddenDiscoveries)
+            try values.encode(automaticIDs, forKey: .automaticIDs)
         }
     }
 }

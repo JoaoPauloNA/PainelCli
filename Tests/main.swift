@@ -140,10 +140,12 @@ func createSyntheticExecutable(_ url: URL) throws {
 let discoveryHome = testRoot.appendingPathComponent("discovery-home", isDirectory: true)
 let syntheticClaude = discoveryHome.appendingPathComponent(".local/bin/claude")
 let syntheticClaudeTarget = discoveryHome.appendingPathComponent(".local/share/claude/versions/2.1.test")
+let syntheticAntigravity = discoveryHome.appendingPathComponent(".local/bin/agy")
 let syntheticBundledCodex = testRoot.appendingPathComponent("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
 try createSyntheticExecutable(syntheticClaudeTarget)
 try fileManager.createDirectory(at: syntheticClaude.deletingLastPathComponent(), withIntermediateDirectories: true)
 try fileManager.createSymbolicLink(at: syntheticClaude, withDestinationURL: syntheticClaudeTarget)
+try createSyntheticExecutable(syntheticAntigravity)
 try createSyntheticExecutable(syntheticBundledCodex)
 let discoveryService = CLIInstallService(
     applicationSupportDirectory: testRoot.appendingPathComponent("discovery-support"),
@@ -160,50 +162,71 @@ require(discovered.first(where: { $0.provider == .claude })?.executableURL.path 
         "symlink target is inspected while the stable user-facing path is retained")
 require(discovered.allSatisfy { !$0.isManaged }, "external discoveries remain distinct from app-managed installs")
 
+let discoveredInstallations = discoveryService.detectedInstallations()
+let agy = discoveredInstallations.first(where: { $0.target == .antigravity })
+require(agy?.discoveryURL.path == syntheticAntigravity.path && agy?.displayName == "Antigravity",
+        "agy is discovered as an uninstalled-catalog Antigravity target")
+require(CLIProvider.allCases.map(\.rawValue) == ["CodexCLI", "ClaudeCLI", "GeminiCLI"],
+        "Antigravity remains outside the installable catalog")
+
 let reconciliationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("reconciliation"))
 let manualCodex = try reconciliationStore.add(provider: CLIProvider.codex.rawValue)[0]
-let firstReconciliation = try reconciliationStore.reconcile(discoveries: discovered)
-require(firstReconciliation.filter { $0.provider == CLIProvider.codex.rawValue }.count == 1,
-        "existing manual Codex record is reused instead of duplicated")
-let autoClaude = firstReconciliation.first(where: { $0.provider == CLIProvider.claude.rawValue })
-require(autoClaude?.origin == .automatic && autoClaude?.detectedPath == syntheticClaude.path,
-        "unregistered installed Claude is added automatically")
-let stableReconciliation = try reconciliationStore.reconcile(discoveries: discovered)
-require(stableReconciliation == firstReconciliation, "repeated discovery keeps automatic IDs and ordinals stable")
-let autoClaudeID = try XCTUnwrapForTests(autoClaude?.id, "automatic Claude record has an ID")
-_ = try reconciliationStore.remove(id: autoClaudeID)
-let afterAutomaticRemoval = try reconciliationStore.reconcile(discoveries: discovered)
-require(!afterAutomaticRemoval.contains(where: { $0.provider == CLIProvider.claude.rawValue }),
-        "removing automatic record suppresses rediscovery")
-let manualClaude = try reconciliationStore.add(provider: CLIProvider.claude.rawValue).last
-require(manualClaude?.origin == .manual, "catalog add remains available for a suppressed discovery")
-let afterManualRemoval = try reconciliationStore.remove(id: manualClaude!.id,
-                                                        suppressingDiscoveryPaths: [syntheticClaude.path])
-require(!afterManualRemoval.contains(where: { $0.provider == CLIProvider.claude.rawValue }),
-        "removing a manual record does not immediately recreate its detected row")
-let relocatedClaude = try reconciliationStore.reconcile(discoveries: [
-    CLIDetection(provider: .claude,
-                 executableURL: discoveryHome.appendingPathComponent("opt/claude"),
-                 discoveryURL: discoveryHome.appendingPathComponent("opt/claude"),
-                 isManaged: false)
-])
-require(relocatedClaude.first(where: { $0.provider == CLIProvider.claude.rawValue })?.ordinal == 3,
-        "a new path remains discoverable after the removed path was hidden")
-let afterUninstall = try reconciliationStore.reconcile(discoveries: [])
-require(!afterUninstall.contains(where: { $0.origin == .automatic }),
-        "stale automatic row disappears when its executable is no longer detected")
+let firstSnapshot = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
+require(firstSnapshot.manualRegistrations == [manualCodex], "manual registration remains independent")
+require(firstSnapshot.detectedInstallations.count == 3,
+        "automatic installations are always present alongside a manual registration")
+require(firstSnapshot.detectedInstallations.map(\.target).contains(.codex) &&
+        firstSnapshot.detectedInstallations.map(\.target).contains(.antigravity),
+        "detections are represented separately from manual registrations")
+let stableSnapshot = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
+require(stableSnapshot.detectedInstallations == firstSnapshot.detectedInstallations,
+        "repeated discovery keeps automatic IDs stable and has no ordinal field")
+let automaticID = firstSnapshot.detectedInstallations.first(where: { $0.target == .claude })!.id
+do {
+    _ = try reconciliationStore.remove(id: automaticID)
+    fatalError("automatic installations cannot be removed as registrations")
+} catch CLIEntryStore.StoreError.entryNotFound {
+}
+let manualClaude = try reconciliationStore.add(provider: CLIProvider.claude.rawValue).last!
+require(manualClaude.ordinal == 1, "manual registration starts its own ordinal sequence")
+let snapshotWithDuplicates = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
+require(snapshotWithDuplicates.manualRegistrations.map(\.provider) == ["CodexCLI", "ClaudeCLI"],
+        "manual registrations can duplicate providers independently from detections")
+require(snapshotWithDuplicates.detectedInstallations == firstSnapshot.detectedInstallations,
+        "adding a manual registration never promotes or hides a detection")
+_ = try reconciliationStore.remove(id: manualClaude.id,
+                                   suppressingDiscoveryPaths: [syntheticClaude.path])
+let afterManualRemoval = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
+require(afterManualRemoval.detectedInstallations == firstSnapshot.detectedInstallations,
+        "removing a manual registration cannot suppress automatic discovery")
+let afterUninstall = try reconciliationStore.snapshot(discoveries: [])
+require(afterUninstall.detectedInstallations.isEmpty && afterUninstall.manualRegistrations == [manualCodex],
+        "automatic presentation follows current disk state and disappears after uninstall")
+let rediscovered = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
+require(rediscovered.detectedInstallations == firstSnapshot.detectedInstallations,
+        "a rediscovered executable regains the same stable identity")
 
-let promotionStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("promotion"))
-let codexDetection = try XCTUnwrapForTests(discovered.first(where: { $0.provider == .codex }),
-                                           "synthetic Codex detection exists")
-let autoCodex = try XCTUnwrapForTests(try promotionStore.reconcile(discoveries: [codexDetection]).first,
-                                      "automatic Codex row is created")
-let promotedCodex = try promotionStore.add(provider: CLIProvider.codex.rawValue).first!
-require(promotedCodex.id == autoCodex.id && promotedCodex.origin == .manual,
-        "explicit catalog add reuses an automatic row rather than duplicating it")
-let promotedReconciliation = try promotionStore.reconcile(discoveries: discovered)
-require(tryOptionalEmpty(promotedReconciliation, provider: .codex),
-        "promoted manual record suppresses a second automatic row")
+let migrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("migration"))
+try fileManager.createDirectory(at: migrationStore.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+let migratedManualID = UUID()
+let migratedAutomaticID = UUID()
+let migrationJSON = """
+{"entries":[{"id":"\(migratedManualID.uuidString)","provider":"ClaudeCLI","ordinal":2},{"id":"\(migratedAutomaticID.uuidString)","provider":"ClaudeCLI","ordinal":3,"origin":"automatic","detectedPath":"\(syntheticClaude.path)"}],"highestOrdinals":{"ClaudeCLI":3},"hiddenDiscoveries":["\(syntheticClaude.path)"]}
+"""
+try Data(migrationJSON.utf8).write(to: migrationStore.fileURL)
+let migratedSnapshot = try migrationStore.snapshot(discoveries: discoveredInstallations)
+require(migratedSnapshot.manualRegistrations.count == 1 &&
+        migratedSnapshot.manualRegistrations[0].id == migratedManualID &&
+        migratedSnapshot.manualRegistrations[0].ordinal == 2,
+        "legacy automatic records are removed while manual IDs and ordinals survive")
+require(migratedSnapshot.detectedInstallations.first(where: { $0.target == .claude })?.id == migratedAutomaticID,
+        "legacy automatic identity migrates into the detection identity map")
+let migratedBytes = try String(contentsOf: migrationStore.fileURL, encoding: .utf8)
+require(!migratedBytes.contains("hiddenDiscoveries") && !migratedBytes.contains("automatic\""),
+        "legacy hide state and automatic rows are cleared from persistence")
+let afterMigrationAdd = try migrationStore.add(provider: "ClaudeCLI")
+require(afterMigrationAdd.last?.ordinal == 4,
+        "legacy high-water value is retained to avoid reusing a previously issued number")
 
 func XCTUnwrapForTests<T>(_ value: T?, _ message: String) throws -> T {
     guard let value else { fatalError(message) }

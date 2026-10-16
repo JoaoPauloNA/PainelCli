@@ -22,6 +22,44 @@ enum CLIProvider: String, CaseIterable {
     }
 }
 
+/// Targets visible in automatic discovery. Antigravity is intentionally discovery-only;
+/// adding it here does not make it an installable catalog provider.
+enum CLIDiscoveryTarget: String, Codable, CaseIterable, Hashable {
+    case codex = "CodexCLI"
+    case claude = "ClaudeCLI"
+    case gemini = "GeminiCLI"
+    case antigravity = "AntigravityCLI"
+
+    var displayName: String {
+        switch self {
+        case .codex: return "Codex"
+        case .claude: return "Claude"
+        case .gemini: return "Gemini"
+        case .antigravity: return "Antigravity"
+        }
+    }
+
+    var executableName: String {
+        switch self {
+        case .codex: return "codex"
+        case .claude: return "claude"
+        case .gemini: return "gemini"
+        case .antigravity: return "agy"
+        }
+    }
+
+    var installableProvider: CLIProvider? { CLIProvider(rawValue: rawValue) }
+
+    init?(legacyProviderName: String) {
+        switch legacyProviderName {
+        case CLIProvider.codex.rawValue: self = .codex
+        case CLIProvider.claude.rawValue: self = .claude
+        case CLIProvider.gemini.rawValue: self = .gemini
+        default: return nil
+        }
+    }
+}
+
 struct CLIInstallPlan: Equatable {
     let provider: CLIProvider
     let npmURL: URL
@@ -71,6 +109,15 @@ struct CLIDetection: Equatable {
     let isManaged: Bool
 }
 
+struct CLIDiscovery: Equatable {
+    let target: CLIDiscoveryTarget
+    let executableURL: URL
+    let discoveryURL: URL
+    let isManaged: Bool
+
+    var displayName: String { target.displayName }
+}
+
 struct CLIInstallService {
     private let fileManager: FileManager
     private let supportDirectory: URL
@@ -112,6 +159,18 @@ struct CLIInstallService {
 
     func detectedExecutables() -> [CLIDetection] {
         CLIProvider.allCases.flatMap(detectedExecutables(for:))
+    }
+
+    /// File-system-only inventory across installable CLIs and discovery-only targets.
+    /// This does not invoke an executable, authenticate, or alter a catalog entry.
+    func detectedInstallations() -> [CLIDiscovery] {
+        let installable = detectedExecutables().map { detection in
+            CLIDiscovery(target: CLIDiscoveryTarget(rawValue: detection.provider.rawValue)!,
+                         executableURL: detection.executableURL,
+                         discoveryURL: detection.discoveryURL,
+                         isManaged: detection.isManaged)
+        }
+        return installable + detectedAntigravityExecutables()
     }
 
     func detectedExecutables(for provider: CLIProvider) -> [CLIDetection] {
@@ -176,6 +235,21 @@ struct CLIInstallService {
                     .appendingPathComponent(appRelativePath),
                 homeDirectory.appendingPathComponent("Applications/ChatGPT.app", isDirectory: true)
                     .appendingPathComponent(appRelativePath)]
+    }
+
+    private func detectedAntigravityExecutables() -> [CLIDiscovery] {
+        var candidates = searchDirectories().map { $0.appendingPathComponent("agy", isDirectory: false) }
+        candidates.append(homeDirectory.appendingPathComponent(".local/bin/agy", isDirectory: false))
+        var seen = Set<String>()
+        return candidates.compactMap { candidate in
+            guard fileManager.isExecutableFile(atPath: candidate.path) else { return nil }
+            let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
+            guard seen.insert(resolved.path).inserted else { return nil }
+            return CLIDiscovery(target: .antigravity,
+                                executableURL: resolved,
+                                discoveryURL: candidate.standardizedFileURL,
+                                isManaged: false)
+        }
     }
 
     private func searchDirectories() -> [URL] {
