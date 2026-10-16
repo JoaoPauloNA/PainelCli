@@ -402,11 +402,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                        target: self, action: #selector(toggleSimulatedSession(_:)))
                 account.bezelStyle = .inline
                 account.isBordered = false
-                account.contentTintColor = simulatedLoggedIn ? .systemOrange : .systemGreen
                 account.tag = index
                 let isManualEntry = entry.manualEntry != nil
                 let demoAction = simulatedLoggedIn ? "Deslogar" : "Logar"
                 account.isEnabled = isManualEntry
+                account.contentTintColor = account.isEnabled
+                    ? (simulatedLoggedIn ? .systemOrange : .systemGreen) : .disabledControlTextColor
                 account.toolTip = isManualEntry
                     ? "\(demoAction) · simulação visual, sem autenticação real"
                     : "Login e logout indisponíveis para instalações detectadas"
@@ -425,9 +426,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                       target: self, action: #selector(removeCLI(_:)))
                 remove.bezelStyle = .inline
                 remove.isBordered = false
-                remove.contentTintColor = .systemRed
                 remove.tag = index
                 remove.isEnabled = isManualEntry && !storageLoadFailed
+                remove.contentTintColor = remove.isEnabled ? .systemRed : .disabledControlTextColor
                 remove.toolTip = isManualEntry
                     ? "Remover \(entry.displayName) da lista"
                     : "Instalações detectadas não podem ser removidas daqui"
