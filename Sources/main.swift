@@ -297,6 +297,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (NSImage(systemSymbolName: symbol, accessibilityDescription: target.displayName) ?? cliSymbol(), tint)
     }
 
+    // Presentation only. The caller owns availability, target/action, and isolated-install rules.
+    private func makeInstallButton(displayName: String, tag: Int) -> NSButton {
+        let button = NSButton(title: "Instalar",
+                              image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil) ?? NSImage(),
+                              target: nil, action: nil)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.font = .systemFont(ofSize: 12, weight: .medium)
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
+        button.tag = tag
+        button.setAccessibilityLabel("Instalar \(displayName)")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        return button
+    }
+
     private func renderEntryList(in body: NSView) {
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -459,19 +475,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let textTrailing = actions.leadingAnchor
                 if isManualEntry {
-                    let install = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)!,
-                                           target: nil, action: nil)
-                    install.bezelStyle = .inline
-                    install.isBordered = false
-                    install.tag = index
+                    let install = makeInstallButton(displayName: entry.displayName, tag: index)
                     install.isEnabled = false
                     install.contentTintColor = .disabledControlTextColor
                     install.toolTip = "Instalação indisponível até haver diretório isolado por cadastro"
-                    install.setAccessibilityLabel("Instalação indisponível para \(entry.displayName)")
+                    install.setAccessibilityLabel("Instalar \(entry.displayName), indisponível até haver isolamento por cadastro")
                     install.setAccessibilityValue("Isolamento por cadastro não disponível")
                     install.translatesAutoresizingMaskIntoConstraints = false
                     actions.insertArrangedSubview(install, at: 0)
-                    install.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                    install.widthAnchor.constraint(greaterThanOrEqualToConstant: 92).isActive = true
                     install.heightAnchor.constraint(equalToConstant: 28).isActive = true
                 }
                 let separator = NSBox()
