@@ -596,7 +596,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     install.contentTintColor = install.isEnabled
                         ? (isInstalled ? .systemOrange : .controlAccentColor) : .disabledControlTextColor
                     install.toolTip = isInstalled
-                        ? "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados; isso não encerra a sessão."
+                        ? (manualEntry.provider == CLIProvider.claude.rawValue
+                            ? "Sair deste cadastro e remover o pacote Claude; configurações e histórico ficam para reinstalação."
+                            : "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados.")
                         : state.displayText
                     install.setAccessibilityLabel(isInstalled
                         ? "Desinstalar \(providerName) gerenciado de \(entry.displayName)"
@@ -1160,7 +1162,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         let providerName = CLIProvider(rawValue: entry.provider)?.catalogTitle ?? entry.provider
         alert.messageText = "Desinstalar \(providerName) deste cadastro?"
-        alert.informativeText = "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados. Esta ação não encerra a sessão nem garante revogação remota."
+        alert.informativeText = entry.provider == CLIProvider.claude.rawValue
+            ? "O Claude Code executará o logout oficial neste UUID e confirmará a saída antes de remover o pacote. Configurações, histórico e cache ficam para reinstalação, mas será necessário fazer login novamente. A ação não garante revogação de todas as sessões remotas. Se o logout falhar, o pacote e o cadastro serão mantidos."
+            : "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Desinstalar")
         alert.addButton(withTitle: "Cancelar")
@@ -1178,8 +1182,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch result {
                 case .success:
                     self.installationFailures.removeValue(forKey: entry.id)
-                    self.authenticationStates[entry.id] = .statusError(
-                        "Credenciais locais preservadas; reinstale para verificar ou sair.")
+                    self.authenticationStates[entry.id] = entry.provider == CLIProvider.claude.rawValue
+                        ? .notAuthenticated
+                        : .statusError("Credenciais locais preservadas; reinstale para verificar ou sair.")
                 case .failure:
                     self.showStoreFailure("O pacote deste cadastro não foi removido integralmente. Verifique o estado antes de repetir a ação.")
                 }

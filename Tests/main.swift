@@ -698,6 +698,7 @@ require(ClaudeCLIAuthStatusDocument.parse(claudeStatusJSON("claude.ai", configDi
 let claudeSupport = testRoot.appendingPathComponent("claude-isolation-support")
 let claudeEntry = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 0)
 var claudeLoggedIn = false
+var claudeLogoutShouldFail = false
 var claudeLoginLaunch: (URL, [String], [String: String])?
 let syntheticClaudeNPM = SyntheticNPMRunner(executableName: "claude")
 let claudeService = CLIInstallService(
@@ -727,6 +728,7 @@ let claudeService = CLIInstallService(
                                                              configDirectory: environment["CLAUDE_CONFIG_DIR"]!))
         }
         if arguments == ["auth", "logout"] {
+            if claudeLogoutShouldFail { return CLICommandOutput(status: 17, stdout: Data()) }
             claudeLoggedIn = false
             return CLICommandOutput(status: 0, stdout: Data())
         }
@@ -792,27 +794,57 @@ require(claudePostLogoutStatus == .notAuthenticated && !claudeLoggedIn,
 let claudeRetainedConfig = claudeService.registrationDirectory(for: claudeEntry)
     .appendingPathComponent("installation/claude-config/settings.json")
 try Data("synthetic settings".utf8).write(to: claudeRetainedConfig)
+claudeLoggedIn = true
+claudeLogoutShouldFail = true
+do {
+    try claudeService.uninstall(entry: claudeEntry)
+    fatalError("Claude uninstall must preserve the CLI and row if logout cannot be confirmed")
+} catch CLIInstallError.claudeLogoutFailed(17) {
+}
+require(claudeService.registrationInstallStatus(for: claudeEntry) == .installed && claudeLoggedIn &&
+        fileManager.fileExists(atPath: claudeRetainedConfig.path),
+        "failed Claude logout keeps the managed package, login config, and registration available")
+claudeLogoutShouldFail = false
+claudeLoggedIn = true
 try claudeService.uninstall(entry: claudeEntry)
 require(claudeService.registrationInstallStatus(for: claudeEntry) == .notInstalled &&
-        fileManager.fileExists(atPath: claudeRetainedConfig.path),
-        "Claude uninstall removes the package while retaining UUID settings and login data")
+        !claudeLoggedIn && fileManager.fileExists(atPath: claudeRetainedConfig.path),
+        "Claude uninstall verifies official logout before removing the package and retains only non-auth settings")
 var claudeRecordRemoved = false
-do {
-    try claudeService.removeRegistration(entry: claudeEntry) { claudeRecordRemoved = true }
-    fatalError("Claude trash must not leave a config-directory-keyed Keychain item")
-} catch CLIInstallError.claudeReinstallRequiredForKeychainCleanup {
-}
-require(!claudeRecordRemoved && fileManager.fileExists(atPath: claudeRetainedConfig.path),
-        "Claude trash preserves the row and data if its Keychain credential cannot be safely cleaned")
-_ = try claudeService.install(entry: claudeEntry)
-claudeLoggedIn = true
 try claudeService.removeRegistration(entry: claudeEntry) { claudeRecordRemoved = true }
 require(claudeRecordRemoved && !claudeLoggedIn &&
         !fileManager.fileExists(atPath: claudeService.registrationDirectory(for: claudeEntry).path),
-        "Claude trash cleans the UUID-keyed credential before deleting UUID-local data")
+        "Claude trash after uninstall uses the verified UUID receipt and removes the registration without reinstall")
 require(claudeService.registrationInstallStatus(for: claudeSiblingEntry) == .installed,
         "trashing one Claude UUID leaves its sibling package and auth root untouched")
 try claudeService.removeRegistration(entry: claudeSiblingEntry) { }
+let unverifiedClaudeEntry = try registrationStore.add(provider: .claude).last!
+_ = try claudeService.install(entry: unverifiedClaudeEntry)
+claudeLoggedIn = true
+let unverifiedClaudeRoot = claudeService.registrationDirectory(for: unverifiedClaudeEntry)
+    .appendingPathComponent("installation", isDirectory: true)
+try fileManager.removeItem(at: unverifiedClaudeRoot.appendingPathComponent("package", isDirectory: true))
+try fileManager.removeItem(at: unverifiedClaudeRoot.appendingPathComponent("install.json"))
+var unverifiedClaudeRecordRemoved = false
+do {
+    try claudeService.removeRegistration(entry: unverifiedClaudeEntry) {
+        unverifiedClaudeRecordRemoved = true
+    }
+    fatalError("Claude trash must not infer logout when the package vanished without a receipt")
+} catch CLIInstallError.claudeCleanupReceiptRequired {
+}
+let recordsAfterUnverifiedClaudeRemoval = try registrationStore.load()
+require(!unverifiedClaudeRecordRemoved && claudeLoggedIn &&
+        recordsAfterUnverifiedClaudeRemoval.contains(where: { $0.id == unverifiedClaudeEntry.id }) &&
+        fileManager.fileExists(atPath: unverifiedClaudeRoot.appendingPathComponent("claude-config").path),
+        "unverified uninstall retains the Claude registration, config, and recoverable login path")
+_ = try claudeService.install(entry: unverifiedClaudeEntry)
+try claudeService.removeRegistration(entry: unverifiedClaudeEntry) {
+    _ = try registrationStore.remove(id: unverifiedClaudeEntry.id)
+    unverifiedClaudeRecordRemoved = true
+}
+require(unverifiedClaudeRecordRemoved && !claudeLoggedIn,
+        "repairing an unverified transition restores the official cleanup path before trash")
 let ordinalClaudeZero = try registrationStore.add(provider: .claude).last!
 _ = try registrationStore.remove(id: ordinalClaudeZero.id)
 let replacementClaudeZero = try registrationStore.add(provider: .claude).last!

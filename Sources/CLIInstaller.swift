@@ -101,7 +101,8 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case unsupportedAuthenticationMethod
     case authenticationStatusUnavailable
     case unsupportedClaudeVersion
-    case claudeReinstallRequiredForKeychainCleanup
+    case claudeLogoutFailed(Int32)
+    case claudeCleanupReceiptRequired
 
     var errorDescription: String? {
         switch self {
@@ -139,8 +140,10 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "A CLI não retornou um status de autenticação verificável para este cadastro."
         case .unsupportedClaudeVersion:
             return "A versão instalada não oferece o comando oficial de status de autenticação necessário."
-        case .claudeReinstallRequiredForKeychainCleanup:
-            return "Reinstale o Claude Code neste cadastro antes de removê-lo definitivamente, para que a própria CLI possa limpar com segurança a credencial escopada no Keychain."
+        case .claudeLogoutFailed(let status):
+            return "O logout oficial do Claude Code falhou (código \(status)); o pacote e o cadastro foram mantidos."
+        case .claudeCleanupReceiptRequired:
+            return "O logout oficial deste cadastro não foi comprovado antes da desinstalação. O cadastro e os dados foram mantidos; reinstale o pacote gerenciado e use Desinstalar para limpar a credencial com segurança."
         }
     }
 }
@@ -414,6 +417,13 @@ struct CLIInstallService {
         var npmGlobalConfig: URL { root.appendingPathComponent("npm-global.npmrc") }
     }
 
+    private struct ClaudeCleanupReceipt: Codable {
+        let schemaVersion: Int
+        let registrationID: UUID
+        let configDirectory: String
+        let logoutVerified: Bool
+    }
+
     private let fileManager: FileManager
     private let applicationDirectory: URL
     private let environment: [String: String]
@@ -640,8 +650,8 @@ struct CLIInstallService {
         return finalRoot.appendingPathComponent(Self.codexExecutableRelativePath)
     }
 
-    /// Removes only the package and its manifest for one installed UUID. Runtime data,
-    /// including auth.json, config, history, and caches, remains available for reinstall.
+    /// Claude logout is completed and verified before removing its package so later trash
+    /// can safely delete the UUID config without requiring a reinstall. Codex data is unchanged.
     func uninstall(entry: CLIEntry) throws {
         guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
             throw CLIInstallError.unsupportedProvider
@@ -650,6 +660,10 @@ struct CLIInstallService {
         defer { operationLock.release() }
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
+        }
+        if entry.provider == CLIProvider.claude.rawValue {
+            _ = try logoutClaudeWhileLocked(for: entry)
+            try writeClaudeCleanupReceipt(for: entry)
         }
         try removeManagedPackageAndManifest(for: entry)
     }
@@ -673,15 +687,24 @@ struct CLIInstallService {
             }
         }
 
-        if entry.provider == CLIProvider.claude.rawValue,
-           registrationInstallStatus(for: entry) == .installed {
-            _ = try logoutClaudeWhileLocked(for: entry)
-        } else if entry.provider == CLIProvider.claude.rawValue,
-                  fileManager.fileExists(atPath: installationRoot(for: entry)
-                    .appendingPathComponent("claude-config", isDirectory: true).path) {
-            // The login may be stored in the UUID-keyed macOS Keychain. Deleting only its
-            // config directory cannot remove that entry; require the owned CLI to clean it.
-            throw CLIInstallError.claudeReinstallRequiredForKeychainCleanup
+        if entry.provider == CLIProvider.claude.rawValue {
+            let root = installationRoot(for: entry)
+            let config = root.appendingPathComponent("claude-config", isDirectory: true)
+            switch registrationInstallStatus(for: entry) {
+            case .installed:
+                _ = try logoutClaudeWhileLocked(for: entry)
+            case .installing:
+                throw CLIInstallError.installationInProgress
+            case .unsupported:
+                throw CLIInstallError.unsupportedProvider
+            case .failed:
+                throw CLIInstallError.incompleteInstallation
+            case .incomplete, .notInstalled:
+                if fileManager.fileExists(atPath: config.path),
+                   !hasVerifiedClaudeCleanupReceipt(for: entry) {
+                    throw CLIInstallError.claudeCleanupReceiptRequired
+                }
+            }
         }
 
         switch registrationInstallStatus(for: entry) {
@@ -732,6 +755,41 @@ struct CLIInstallService {
         }
     }
 
+    private func claudeCleanupReceiptURL(for entry: CLIEntry) -> URL {
+        installationRoot(for: entry).appendingPathComponent(".claude-cleanup-receipt.json")
+    }
+
+    private func writeClaudeCleanupReceipt(for entry: CLIEntry) throws {
+        let paths = ClaudeRuntimePaths(root: installationRoot(for: entry))
+        let receipt = ClaudeCleanupReceipt(schemaVersion: 1, registrationID: entry.id,
+                                           configDirectory: paths.config.standardizedFileURL.path,
+                                           logoutVerified: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let receiptURL = claudeCleanupReceiptURL(for: entry)
+        try encoder.encode(receipt).write(to: receiptURL, options: .atomic)
+        try setPrivatePermissions(receiptURL, mode: 0o600)
+        guard hasVerifiedClaudeCleanupReceipt(for: entry) else {
+            throw CLIInstallError.incompleteInstallation
+        }
+    }
+
+    /// This receipt is written only after the managed CLI logged out successfully and
+    /// a fresh status query returned `none` for the exact UUID config directory.
+    private func hasVerifiedClaudeCleanupReceipt(for entry: CLIEntry) -> Bool {
+        let root = installationRoot(for: entry)
+        let receiptURL = claudeCleanupReceiptURL(for: entry)
+        guard isOwnedRealDirectory(root), hasPrivatePermissions(root, allowingOwnerMode: 0o700),
+              isOwnedRegularFile(receiptURL), hasPrivatePermissions(receiptURL, allowingOwnerMode: 0o600),
+              let data = try? Data(contentsOf: receiptURL),
+              let receipt = try? JSONDecoder().decode(ClaudeCleanupReceipt.self, from: data) else {
+            return false
+        }
+        let expectedConfig = ClaudeRuntimePaths(root: root).config.standardizedFileURL.path
+        return receipt.schemaVersion == 1 && receipt.registrationID == entry.id &&
+            receipt.configDirectory == expectedConfig && receipt.logoutVerified
+    }
+
     func claudeAuthenticationStatus(for entry: CLIEntry) throws -> ClaudeCLIAuthenticationStatus {
         guard entry.provider == CLIProvider.claude.rawValue,
               registrationInstallStatus(for: entry) == .installed else {
@@ -771,7 +829,7 @@ struct CLIInstallService {
                                                                npmUserConfig: paths.npmUserConfig,
                                                                npmGlobalConfig: paths.npmGlobalConfig,
                                                                installationPhase: false))
-        guard result.status == 0 else { throw CLIInstallError.commandFailed(result.status) }
+        guard result.status == 0 else { throw CLIInstallError.claudeLogoutFailed(result.status) }
         let after = try claudeAuthenticationStatus(for: entry)
         guard after == .notAuthenticated else { throw CLIInstallError.logoutNotConfirmed }
         return after

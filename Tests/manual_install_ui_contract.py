@@ -62,6 +62,14 @@ if 'NSButton(title: "Instalar"' in source or 'title: "Código"' in source:
     failures.append("install controls are not icons-only or the removed Code route remains visible")
 if "service.uninstall(entry: entry)" not in source or "service.logout(for: entry)" not in source:
     failures.append("UUID-scoped uninstall and logout service operations are not wired")
+uninstall_start = installer.find("func uninstall(entry: CLIEntry) throws")
+uninstall_end = installer.find("func removeRegistration(entry: CLIEntry", uninstall_start)
+uninstall_body = installer[uninstall_start:uninstall_end] if uninstall_start >= 0 and uninstall_end > uninstall_start else ""
+logout_before_package = uninstall_body.find("logoutClaudeWhileLocked(for: entry)")
+receipt_before_package = uninstall_body.find("writeClaudeCleanupReceipt(for: entry)")
+package_removal = uninstall_body.find("removeManagedPackageAndManifest(for: entry)")
+if not (0 <= logout_before_package < receipt_before_package < package_removal):
+    failures.append("Claude uninstall does not verify logout and persist cleanup receipt before package removal")
 if "service.logoutClaude(for: entry)" not in source or "service.startClaudeAuthentication(for: entry)" not in source:
     failures.append("Claude official auth login/logout are not wired to its UUID-scoped service")
 if '"auth", "status", "--json"' not in installer or '"auth", "logout"' not in installer:
@@ -80,6 +88,9 @@ if "Sair deste cadastro?" not in source or "Isso não revoga a sessão remotamen
     failures.append("logout confirmation does not explain local credential scope")
 if "Somente o pacote gerenciado por este UUID será removido" not in source or "serão preservados" not in source:
     failures.append("uninstall confirmation does not explain package/data scope")
+if "O Claude Code executará o logout oficial neste UUID" not in source or \
+        "o pacote e o cadastro serão mantidos" not in source:
+    failures.append("Claude uninstall confirmation does not disclose verified logout and failure retention")
 if "case .statusError" not in source or "state = .statusError" not in source:
     failures.append("indeterminate authentication status can be confused with signed-out state")
 if 'method: "account/login/start", params: ["type": "chatgpt"]' not in installer:
