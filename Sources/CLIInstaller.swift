@@ -87,6 +87,7 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case unsupportedProvider
     case npmUnavailable
     case nodeUnavailable
+    case nodeVersionUnsupported
     case alreadyInstalled
     case notInstalled
     case installationInProgress
@@ -97,6 +98,10 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case authenticationStorageUnavailable
     case logoutNotConfirmed
     case browserUnavailable
+    case unsupportedAuthenticationMethod
+    case authenticationStatusUnavailable
+    case unsupportedClaudeVersion
+    case claudeReinstallRequiredForKeychainCleanup
 
     var errorDescription: String? {
         switch self {
@@ -106,6 +111,8 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "Não encontrei o npm no PATH deste app. Instale o Node.js e tente novamente."
         case .nodeUnavailable:
             return "Não encontrei o Node.js no PATH deste app; o npm não pode iniciar sem ele."
+        case .nodeVersionUnsupported:
+            return "A instalação npm oficial do Claude Code exige Node.js 22 ou posterior. Atualize o Node.js e tente novamente."
         case .alreadyInstalled:
             return "Este cadastro já possui uma instalação isolada."
         case .notInstalled:
@@ -119,13 +126,21 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
         case .commandTimedOut:
             return "npm excedeu 15 minutos; este cadastro não foi marcado como instalado."
         case .authenticationPolicyBlocked:
-            return "A política local não confirma armazenamento de credenciais isolado em arquivo; login bloqueado."
+            return "A configuração deste cadastro não confirma um método de autenticação isolado compatível; login ou remoção bloqueados."
         case .authenticationStorageUnavailable:
             return "O login não pôde ser confirmado no arquivo privado deste cadastro."
         case .logoutNotConfirmed:
             return "A CLI não confirmou a saída deste cadastro; o estado do login continua indeterminado."
         case .browserUnavailable:
             return "Não encontrei o Safari para abrir o fluxo oficial de login."
+        case .unsupportedAuthenticationMethod:
+            return "Este cadastro usa um método de autenticação que o PainelCli não pode isolar com segurança."
+        case .authenticationStatusUnavailable:
+            return "A CLI não retornou um status de autenticação verificável para este cadastro."
+        case .unsupportedClaudeVersion:
+            return "A versão instalada não oferece o comando oficial de status de autenticação necessário."
+        case .claudeReinstallRequiredForKeychainCleanup:
+            return "Reinstale o Claude Code neste cadastro antes de removê-lo definitivamente, para que a própria CLI possa limpar com segurança a credencial escopada no Keychain."
         }
     }
 }
@@ -135,11 +150,44 @@ enum CLIAuthenticationStatus: Equatable {
     case authenticated
 }
 
+enum ClaudeCLIAuthenticationStatus: Equatable {
+    case notAuthenticated
+    case authenticated
+    case unsupportedMethod
+}
+
+struct ClaudeCLIAuthStatusDocument: Equatable {
+    let authMethod: String
+    let configDirectory: String
+
+    static func parse(_ data: Data) -> ClaudeCLIAuthStatusDocument? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let authMethod = object["authMethod"] as? String,
+              let configDirectory = object["configDirectory"] as? String,
+              !configDirectory.isEmpty else { return nil }
+        return ClaudeCLIAuthStatusDocument(authMethod: authMethod,
+                                           configDirectory: configDirectory)
+    }
+
+    func status(expectedConfigDirectory: URL) -> ClaudeCLIAuthenticationStatus? {
+        let expected = expectedConfigDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        let actualURL = URL(fileURLWithPath: configDirectory, isDirectory: true)
+        guard actualURL.standardizedFileURL.resolvingSymlinksInPath().path == expected else { return nil }
+        switch authMethod {
+        case "none": return .notAuthenticated
+        case "claude.ai": return .authenticated
+        case "oauth_token", "api_key", "api_key_helper", "third_party": return .unsupportedMethod
+        default: return nil
+        }
+    }
+}
+
 enum CLIAuthenticationUIState: Equatable {
     case checking
     case notAuthenticated
     case starting
     case awaitingBrowserAuthorization(pageOpened: Bool)
+    case awaitingClaudeBrowser
     case loggingOut
     case authenticated
     case failed(String)
@@ -156,6 +204,7 @@ enum CLIAuthenticationUIState: Equatable {
             return opened
                 ? "Safari aberto. Conclua o login e a autorização."
                 : "Safari não abriu. Tente novamente para iniciar o login pelo navegador."
+        case .awaitingClaudeBrowser: return "Aguardando autorização no navegador pelo fluxo oficial do Claude."
         case .authenticated: return "Autenticado neste cadastro"
         case .failed(let message): return "Falha no login isolado · \(message)"
         case .statusError(let message): return "Estado do login indeterminado · \(message)"
@@ -192,6 +241,11 @@ enum CLIRegistrationInstallStatus: Equatable {
 }
 
 typealias CLICommandRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Int32
+struct CLICommandOutput: Equatable {
+    let status: Int32
+    let stdout: Data
+}
+typealias CLICommandOutputRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> CLICommandOutput
 typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ input: Pipe, _ output: Pipe) throws -> Process
 
 final class CLIRegistrationOperationLock {
@@ -305,9 +359,61 @@ private enum CLIProcessExecutor {
         outputDrain.wait()
         return process.terminationStatus
     }
+
+    static func runCapturingOutput(executable: URL, arguments: [String],
+                                   environment: [String: String]) throws -> CLICommandOutput {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        var data = Data()
+        let drained = DispatchGroup()
+        drained.enter()
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                let chunk = output.fileHandleForReading.readData(ofLength: 4096)
+                if chunk.isEmpty { break }
+                data.append(chunk)
+            }
+            drained.leave()
+        }
+        guard exited.wait(timeout: .now() + .seconds(30)) == .success else {
+            process.terminate()
+            if exited.wait(timeout: .now() + .seconds(3)) != .success {
+                _ = kill(process.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + .seconds(3))
+            }
+            throw CLIInstallError.commandTimedOut
+        }
+        drained.wait()
+        return CLICommandOutput(status: process.terminationStatus, stdout: data)
+    }
 }
 
 struct CLIInstallService {
+    private struct ClaudeRuntimePaths {
+        let root: URL
+        init(root: URL) { self.root = root }
+        var package: URL { root.appendingPathComponent("package", isDirectory: true) }
+        var config: URL { root.appendingPathComponent("claude-config", isDirectory: true) }
+        var home: URL { root.appendingPathComponent("home", isDirectory: true) }
+        var npmHome: URL { root.appendingPathComponent("npm-home", isDirectory: true) }
+        var npmCache: URL { root.appendingPathComponent("npm-cache", isDirectory: true) }
+        var temp: URL { root.appendingPathComponent("tmp", isDirectory: true) }
+        var xdgConfig: URL { root.appendingPathComponent("xdg/config", isDirectory: true) }
+        var xdgCache: URL { root.appendingPathComponent("xdg/cache", isDirectory: true) }
+        var xdgData: URL { root.appendingPathComponent("xdg/data", isDirectory: true) }
+        var npmUserConfig: URL { root.appendingPathComponent("npm-user.npmrc") }
+        var npmGlobalConfig: URL { root.appendingPathComponent("npm-global.npmrc") }
+    }
+
     private let fileManager: FileManager
     private let applicationDirectory: URL
     private let environment: [String: String]
@@ -317,7 +423,9 @@ struct CLIInstallService {
     private let npmExecutableOverride: URL?
     private let nodeExecutableOverride: URL?
     private let processRunner: CLICommandRunner
+    private let outputRunner: CLICommandOutputRunner
     private let authenticationProcessLauncher: CLIAuthenticationProcessLauncher
+    private let safariAvailableOverride: Bool?
 
     init(applicationSupportDirectory: URL,
          fileManager: FileManager = .default,
@@ -328,6 +436,8 @@ struct CLIInstallService {
          npmExecutableOverride: URL? = nil,
          nodeExecutableOverride: URL? = nil,
          processRunner: @escaping CLICommandRunner = CLIProcessExecutor.run,
+         outputRunner: @escaping CLICommandOutputRunner = CLIProcessExecutor.runCapturingOutput,
+         safariAvailableOverride: Bool? = nil,
          authenticationProcessLauncher: @escaping CLIAuthenticationProcessLauncher = CLIProcessExecutor.start) {
         self.fileManager = fileManager
         self.applicationDirectory = applicationSupportDirectory
@@ -339,6 +449,8 @@ struct CLIInstallService {
         self.npmExecutableOverride = npmExecutableOverride
         self.nodeExecutableOverride = nodeExecutableOverride
         self.processRunner = processRunner
+        self.outputRunner = outputRunner
+        self.safariAvailableOverride = safariAvailableOverride
         self.authenticationProcessLauncher = authenticationProcessLauncher
     }
 
@@ -353,7 +465,9 @@ struct CLIInstallService {
     /// Reports only this registration's UUID-scoped installation. A matching executable in
     /// PATH, ChatGPT.app, or another registration never changes this result.
     func registrationInstallStatus(for entry: CLIEntry) -> CLIRegistrationInstallStatus {
-        guard entry.provider == CLIProvider.codex.rawValue else { return .unsupported }
+        guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
+            return .unsupported
+        }
         let root = installationRoot(for: entry)
         guard fileManager.fileExists(atPath: root.appendingPathComponent("install.json").path) else {
             let contents = (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? []
@@ -365,14 +479,32 @@ struct CLIInstallService {
               let manifest = try? JSONDecoder().decode(InstallManifest.self, from: data),
               manifest.registrationID == entry.id,
               manifest.provider == entry.provider,
-              manifest.package == "@openai/codex@latest",
-              manifest.executableRelativePath == Self.codexExecutableRelativePath,
-              let config = try? String(contentsOf: root.appendingPathComponent("codex-home/config.toml"),
-                                       encoding: .utf8),
-              config.contains("cli_auth_credentials_store = \"file\""),
-              fileManager.isExecutableFile(atPath: root.appendingPathComponent(
-                manifest.executableRelativePath).path) else {
+              isSafeRegistrationDirectory(registrationDirectory(for: entry)),
+              isOwnedRealDirectory(root),
+              root.resolvingSymlinksInPath().standardizedFileURL == root.standardizedFileURL,
+              isOwnedRegularFile(root.appendingPathComponent("install.json")),
+              hasPrivatePermissions(root, allowingOwnerMode: 0o700),
+              (try? symlinksStayInside(root)) == true,
+              fileManager.isExecutableFile(atPath: root.appendingPathComponent(manifest.executableRelativePath).path) else {
             return .incomplete
+        }
+        if entry.provider == CLIProvider.codex.rawValue {
+            guard manifest.package == "@openai/codex@latest",
+                  manifest.executableRelativePath == Self.codexExecutableRelativePath,
+                  let config = try? String(contentsOf: root.appendingPathComponent("codex-home/config.toml"),
+                                           encoding: .utf8),
+                  config.contains("cli_auth_credentials_store = \"file\"") else { return .incomplete }
+        } else {
+            guard manifest.package == "@anthropic-ai/claude-code@latest",
+                  manifest.executableRelativePath == Self.claudeExecutableRelativePath,
+                  let version = manifest.version,
+                  Self.isSupportedClaudeVersion(version),
+                  isOwnedRealDirectory(root.appendingPathComponent("claude-config", isDirectory: true)),
+                  hasPrivatePermissions(root.appendingPathComponent("claude-config", isDirectory: true), allowingOwnerMode: 0o700),
+                  isOwnedRealDirectory(root.appendingPathComponent("home", isDirectory: true)),
+                  hasPrivatePermissions(root.appendingPathComponent("home", isDirectory: true), allowingOwnerMode: 0o700),
+                  claudeExecutableResolvesInsideRegistration(root.appendingPathComponent(manifest.executableRelativePath),
+                                                             registrationRoot: root) else { return .incomplete }
         }
         return .installed
     }
@@ -382,6 +514,7 @@ struct CLIInstallService {
     /// It never invokes Codex or starts authentication.
     @discardableResult
     func install(entry: CLIEntry) throws -> URL {
+        if entry.provider == CLIProvider.claude.rawValue { return try installClaude(entry: entry) }
         guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
         let directory = registrationDirectory(for: entry)
         if fileManager.fileExists(atPath: directory.path) {
@@ -404,7 +537,6 @@ struct CLIInstallService {
         guard let node = nodeExecutable(), fileManager.isExecutableFile(atPath: node.path) else {
             throw CLIInstallError.nodeUnavailable
         }
-
         let registrationDirectory = registrationDirectory(for: entry)
         try fileManager.createDirectory(at: registrationDirectory, withIntermediateDirectories: true)
         try setPrivatePermissions(registrationDirectory)
@@ -511,7 +643,9 @@ struct CLIInstallService {
     /// Removes only the package and its manifest for one installed UUID. Runtime data,
     /// including auth.json, config, history, and caches, remains available for reinstall.
     func uninstall(entry: CLIEntry) throws {
-        guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
+        guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
+            throw CLIInstallError.unsupportedProvider
+        }
         let operationLock = try acquireRegistrationLock(for: entry)
         defer { operationLock.release() }
         guard registrationInstallStatus(for: entry) == .installed else {
@@ -524,7 +658,8 @@ struct CLIInstallService {
     /// while holding the same lock used by install, login, logout, and ordinary uninstall.
     /// The optional removal closure runs only after the UUID directory is confirmed absent.
     func removeRegistration(entry: CLIEntry, removeRecord: () throws -> Void) throws {
-        guard entry.origin == .manual, entry.provider == CLIProvider.codex.rawValue else {
+        guard entry.origin == .manual,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
             throw CLIInstallError.unsupportedProvider
         }
         let operationLock = try acquireRegistrationLock(for: entry)
@@ -536,6 +671,17 @@ struct CLIInstallService {
                   try symlinksStayInside(directory) else {
                 throw CLIInstallError.incompleteInstallation
             }
+        }
+
+        if entry.provider == CLIProvider.claude.rawValue,
+           registrationInstallStatus(for: entry) == .installed {
+            _ = try logoutClaudeWhileLocked(for: entry)
+        } else if entry.provider == CLIProvider.claude.rawValue,
+                  fileManager.fileExists(atPath: installationRoot(for: entry)
+                    .appendingPathComponent("claude-config", isDirectory: true).path) {
+            // The login may be stored in the UUID-keyed macOS Keychain. Deleting only its
+            // config directory cannot remove that entry; require the owned CLI to clean it.
+            throw CLIInstallError.claudeReinstallRequiredForKeychainCleanup
         }
 
         switch registrationInstallStatus(for: entry) {
@@ -584,6 +730,209 @@ struct CLIInstallService {
         guard registrationInstallStatus(for: entry) == .notInstalled else {
             throw CLIInstallError.incompleteInstallation
         }
+    }
+
+    func claudeAuthenticationStatus(for entry: CLIEntry) throws -> ClaudeCLIAuthenticationStatus {
+        guard entry.provider == CLIProvider.claude.rawValue,
+              registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let paths = ClaudeRuntimePaths(root: installationRoot(for: entry))
+        let result = try outputRunner(managedExecutableURL(for: entry), ["auth", "status", "--json"],
+                                      claudeRuntimeEnvironment(entry: entry, rootOverride: nil,
+                                                               npm: nil, node: nil,
+                                                               npmUserConfig: paths.npmUserConfig,
+                                                               npmGlobalConfig: paths.npmGlobalConfig,
+                                                               installationPhase: false))
+        guard let document = ClaudeCLIAuthStatusDocument.parse(result.stdout),
+              let status = document.status(expectedConfigDirectory: paths.config) else {
+            throw CLIInstallError.authenticationStatusUnavailable
+        }
+        return status
+    }
+
+    func logoutClaude(for entry: CLIEntry) throws -> ClaudeCLIAuthenticationStatus {
+        guard entry.provider == CLIProvider.claude.rawValue else { throw CLIInstallError.unsupportedProvider }
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
+        return try logoutClaudeWhileLocked(for: entry)
+    }
+
+    private func logoutClaudeWhileLocked(for entry: CLIEntry) throws -> ClaudeCLIAuthenticationStatus {
+        guard registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let before = try claudeAuthenticationStatus(for: entry)
+        guard before != .unsupportedMethod else { throw CLIInstallError.authenticationPolicyBlocked }
+        let paths = ClaudeRuntimePaths(root: installationRoot(for: entry))
+        let result = try outputRunner(managedExecutableURL(for: entry), ["auth", "logout"],
+                                      claudeRuntimeEnvironment(entry: entry, rootOverride: nil,
+                                                               npm: nil, node: nil,
+                                                               npmUserConfig: paths.npmUserConfig,
+                                                               npmGlobalConfig: paths.npmGlobalConfig,
+                                                               installationPhase: false))
+        guard result.status == 0 else { throw CLIInstallError.commandFailed(result.status) }
+        let after = try claudeAuthenticationStatus(for: entry)
+        guard after == .notAuthenticated else { throw CLIInstallError.logoutNotConfirmed }
+        return after
+    }
+
+    func startClaudeAuthentication(for entry: CLIEntry) throws -> CLIAuthenticationSession {
+        let operationLock = try acquireRegistrationLock(for: entry)
+        guard registrationInstallStatus(for: entry) == .installed else {
+            operationLock.release()
+            throw CLIInstallError.incompleteInstallation
+        }
+        do {
+            guard safariAvailableOverride ?? fileManager.isExecutableFile(atPath: Self.safariExecutablePath) else {
+                operationLock.release()
+                throw CLIInstallError.browserUnavailable
+            }
+            let status = try claudeAuthenticationStatus(for: entry)
+            guard status == .notAuthenticated else {
+                operationLock.release()
+                throw status == .authenticated ? CLIInstallError.alreadyInstalled : CLIInstallError.authenticationPolicyBlocked
+            }
+            let paths = ClaudeRuntimePaths(root: installationRoot(for: entry))
+            let input = Pipe()
+            let output = Pipe()
+            var runtime = claudeRuntimeEnvironment(entry: entry, rootOverride: nil,
+                                                   npm: nil, node: nil,
+                                                   npmUserConfig: paths.npmUserConfig,
+                                                   npmGlobalConfig: paths.npmGlobalConfig,
+                                                   installationPhase: false)
+            // Prefer Safari without changing the user's Launch Services default.
+            runtime["BROWSER"] = Self.safariExecutablePath
+            let process = try authenticationProcessLauncher(managedExecutableURL(for: entry),
+                                                            ["auth", "login"], runtime, input, output)
+            return CLIAuthenticationSession(process: process, input: input, output: output,
+                                            operationLock: operationLock)
+        } catch {
+            operationLock.release()
+            throw error
+        }
+    }
+
+    func isolatedClaudeRuntimeEnvironment(for entry: CLIEntry) throws -> [String: String] {
+        guard entry.provider == CLIProvider.claude.rawValue,
+              registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let paths = ClaudeRuntimePaths(root: installationRoot(for: entry))
+        return claudeRuntimeEnvironment(entry: entry, rootOverride: nil,
+                                        npm: nil, node: nil,
+                                        npmUserConfig: paths.npmUserConfig,
+                                        npmGlobalConfig: paths.npmGlobalConfig,
+                                        installationPhase: false)
+    }
+
+    /// Installs the official npm Claude Code package into a UUID-owned prefix. npm/node
+    /// are prerequisites supplied by the user; this flow never installs them globally.
+    @discardableResult
+    private func installClaude(entry: CLIEntry) throws -> URL {
+        let directory = registrationDirectory(for: entry)
+        if fileManager.fileExists(atPath: directory.path) {
+            guard isSafeRegistrationDirectory(directory), try symlinksStayInside(directory) else {
+                throw CLIInstallError.incompleteInstallation
+            }
+        }
+        switch registrationInstallStatus(for: entry) {
+        case .installed: throw CLIInstallError.alreadyInstalled
+        case .installing: throw CLIInstallError.installationInProgress
+        case .incomplete: throw CLIInstallError.incompleteInstallation
+        case .unsupported: throw CLIInstallError.unsupportedProvider
+        case .notInstalled, .failed: break
+        }
+        guard let npm = npmExecutable(), fileManager.isExecutableFile(atPath: npm.path) else {
+            throw CLIInstallError.npmUnavailable
+        }
+        guard let node = nodeExecutable(), fileManager.isExecutableFile(atPath: node.path) else {
+            throw CLIInstallError.nodeUnavailable
+        }
+        let nodeVersion = try outputRunner(node, ["--version"], ["PATH": node.deletingLastPathComponent().path])
+        guard nodeVersion.status == 0, Self.isSupportedNodeVersion(nodeVersion.stdout) else {
+            throw CLIInstallError.nodeVersionUnsupported
+        }
+
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try setPrivatePermissions(directory)
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
+        switch registrationInstallStatus(for: entry) {
+        case .installed: throw CLIInstallError.alreadyInstalled
+        case .installing: throw CLIInstallError.installationInProgress
+        case .incomplete: throw CLIInstallError.incompleteInstallation
+        case .unsupported: throw CLIInstallError.unsupportedProvider
+        case .notInstalled, .failed: break
+        }
+
+        let stage = directory.appendingPathComponent(".stage-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: stage, withIntermediateDirectories: false)
+        try setPrivatePermissions(stage)
+        var published = false
+        defer { if !published { try? fileManager.removeItem(at: stage) } }
+
+        let paths = ClaudeRuntimePaths(root: stage)
+        let finalRoot = installationRoot(for: entry)
+        let hasRetainedRoot = fileManager.fileExists(atPath: finalRoot.path)
+        if hasRetainedRoot { try copyRetainedRegistrationData(from: finalRoot, to: stage) }
+        for path in [paths.package, paths.config, paths.home, paths.npmHome, paths.npmCache,
+                     paths.temp, paths.xdgConfig, paths.xdgCache, paths.xdgData] {
+            try fileManager.createDirectory(at: path, withIntermediateDirectories: true)
+            try setPrivatePermissions(path)
+        }
+        for config in [paths.npmUserConfig, paths.npmGlobalConfig] {
+            try Data().write(to: config, options: .atomic)
+            try setPrivatePermissions(config, mode: 0o600)
+        }
+        let installEnvironment = claudeRuntimeEnvironment(entry: entry, rootOverride: stage,
+                                                         npm: npm, node: node,
+                                                         npmUserConfig: paths.npmUserConfig,
+                                                         npmGlobalConfig: paths.npmGlobalConfig,
+                                                         installationPhase: true)
+        let arguments = ["install", "--prefix", paths.package.path,
+                         "--userconfig", paths.npmUserConfig.path,
+                         "--globalconfig", paths.npmGlobalConfig.path,
+                         "--registry", "https://registry.npmjs.org", "--no-audit", "--no-fund",
+                         "--no-save", "--no-package-lock", "@anthropic-ai/claude-code@latest"]
+        let installStatus = try processRunner(npm, arguments, installEnvironment)
+        guard installStatus == 0 else { throw CLIInstallError.commandFailed(installStatus) }
+
+        let executable = stage.appendingPathComponent(Self.claudeExecutableRelativePath)
+        guard claudeExecutableResolvesInsideRegistration(executable, registrationRoot: stage) else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        guard try symlinksStayInside(stage) else { throw CLIInstallError.incompleteInstallation }
+        let versionResult = try outputRunner(executable, ["--version"],
+                                             claudeRuntimeEnvironment(entry: entry, rootOverride: stage,
+                                                                      npm: nil, node: nil,
+                                                                      npmUserConfig: paths.npmUserConfig,
+                                                                      npmGlobalConfig: paths.npmGlobalConfig,
+                                                                      installationPhase: false))
+        guard versionResult.status == 0,
+              let version = Self.parseClaudeVersion(versionResult.stdout),
+              Self.isSupportedClaudeVersion(version) else { throw CLIInstallError.unsupportedClaudeVersion }
+        let manifest = InstallManifest(registrationID: entry.id, provider: entry.provider,
+                                       package: "@anthropic-ai/claude-code@latest",
+                                       executableRelativePath: Self.claudeExecutableRelativePath,
+                                       version: version)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(manifest).write(to: stage.appendingPathComponent("install.json"), options: .atomic)
+        let backupRoot = directory.appendingPathComponent(".uninstalled-\(UUID().uuidString)",
+                                                          isDirectory: true)
+        if hasRetainedRoot { try fileManager.moveItem(at: finalRoot, to: backupRoot) }
+        do {
+            try fileManager.moveItem(at: stage, to: finalRoot)
+        } catch {
+            if hasRetainedRoot, fileManager.fileExists(atPath: backupRoot.path) {
+                try? fileManager.moveItem(at: backupRoot, to: finalRoot)
+            }
+            throw error
+        }
+        if hasRetainedRoot { try fileManager.removeItem(at: backupRoot) }
+        published = true
+        return finalRoot.appendingPathComponent(Self.claudeExecutableRelativePath)
     }
 
     /// Runtime variables are assembled from an allowlist. This keeps HOME, CODEX_HOME,
@@ -773,7 +1122,8 @@ struct CLIInstallService {
     }
 
     func managedExecutableURL(for entry: CLIEntry) -> URL {
-        installationRoot(for: entry).appendingPathComponent(Self.codexExecutableRelativePath)
+        installationRoot(for: entry).appendingPathComponent(entry.provider == CLIProvider.claude.rawValue
+            ? Self.claudeExecutableRelativePath : Self.codexExecutableRelativePath)
     }
 
     /// Inspects executable bits and paths only. No discovered CLI is invoked or authenticated.
@@ -839,6 +1189,79 @@ struct CLIInstallService {
             if let value = environment[key] { result[key] = value }
         }
         return result
+    }
+
+    private func claudeRuntimeEnvironment(entry: CLIEntry, rootOverride: URL?, npm: URL?, node: URL?,
+                                          npmUserConfig: URL, npmGlobalConfig: URL,
+                                          installationPhase: Bool) -> [String: String] {
+        let paths = ClaudeRuntimePaths(root: rootOverride ?? installationRoot(for: entry))
+        var path = [paths.package.appendingPathComponent("node_modules/.bin").path]
+        if installationPhase, let npm, let node {
+            path = [npm.deletingLastPathComponent().path, node.deletingLastPathComponent().path] + path
+        }
+        let hostPath = (environment["PATH"] ?? "/usr/bin:/bin")
+            .split(separator: ":").map(String.init)
+        path += hostPath.filter { directory in
+            !fileManager.isExecutableFile(atPath: URL(fileURLWithPath: directory)
+                .appendingPathComponent("claude").path)
+        }
+        var result = ["PATH": path.joined(separator: ":"),
+                      "HOME": installationPhase ? paths.npmHome.path : paths.home.path,
+                      "CLAUDE_CONFIG_DIR": paths.config.path,
+                      "CLAUDE_CODE_TMPDIR": paths.temp.path,
+                      "TMPDIR": paths.temp.path,
+                      "XDG_CONFIG_HOME": paths.xdgConfig.path,
+                      "XDG_CACHE_HOME": paths.xdgCache.path,
+                      "XDG_DATA_HOME": paths.xdgData.path,
+                      "DISABLE_UPDATES": "1",
+                      "DISABLE_AUTOUPDATER": "1"]
+        if installationPhase {
+            result["NPM_CONFIG_CACHE"] = paths.npmCache.path
+            result["NPM_CONFIG_PREFIX"] = paths.package.path
+            result["NPM_CONFIG_USERCONFIG"] = npmUserConfig.path
+            result["NPM_CONFIG_GLOBALCONFIG"] = npmGlobalConfig.path
+            result["CI"] = "1"
+        }
+        for key in ["LANG", "LC_ALL", "TERM"] {
+            if let value = environment[key] { result[key] = value }
+        }
+        return result
+    }
+
+    private func claudeExecutableResolvesInsideRegistration(_ executable: URL,
+                                                            registrationRoot: URL) -> Bool {
+        let root = registrationRoot.standardizedFileURL.resolvingSymlinksInPath().path
+        let resolved = executable.standardizedFileURL.resolvingSymlinksInPath()
+        var info = stat()
+        return resolved.path.hasPrefix(root + "/") &&
+            lstat(resolved.path, &info) == 0 &&
+            (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == getuid() &&
+            fileManager.isExecutableFile(atPath: resolved.path)
+    }
+
+    private static func parseClaudeVersion(_ data: Data) -> String? {
+        guard let output = String(data: data, encoding: .utf8) else { return nil }
+        let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespaces).first ?? ""
+        let components = version.split(separator: ".")
+        guard components.count == 3, components.allSatisfy({ Int($0) != nil }) else { return nil }
+        return version
+    }
+
+    private static func isSupportedNodeVersion(_ data: Data) -> Bool {
+        guard let value = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let major = Int(value.drop(while: { !$0.isNumber }).prefix(while: \.isNumber)) else { return false }
+        return major >= 22
+    }
+
+    private static func isSupportedClaudeVersion(_ version: String) -> Bool {
+        let components = version.split(separator: ".").compactMap { Int($0) }
+        guard components.count == 3 else { return false }
+        let minimum = [2, 1, 268]
+        for index in 0..<3 {
+            if components[index] != minimum[index] { return components[index] > minimum[index] }
+        }
+        return true
     }
 
     private func setPrivatePermissions(_ url: URL, mode: Int16 = 0o700) throws {
@@ -921,7 +1344,13 @@ struct CLIInstallService {
                 ? URL(fileURLWithPath: rawTarget)
                 : item.deletingLastPathComponent().appendingPathComponent(rawTarget)
             let resolvedPath = target.standardizedFileURL.resolvingSymlinksInPath().path
-            guard resolvedPath == rootPath || resolvedPath.hasPrefix(rootPath + "/") else { return false }
+            if resolvedPath == rootPath || resolvedPath.hasPrefix(rootPath + "/") { continue }
+            // Browser profile IPC can leave links to its Unix socket outside the UUID.
+            // Allow unlinking that reference only; directory removal never follows it.
+            var targetInfo = stat()
+            guard stat(target.path, &targetInfo) == 0,
+                  (targetInfo.st_mode & S_IFMT) == S_IFSOCK,
+                  targetInfo.st_uid == getuid() else { return false }
         }
         return true
     }
@@ -937,7 +1366,7 @@ struct CLIInstallService {
 
     private func copyRetainedRegistrationData(from source: URL, to destination: URL) throws {
         guard isRealDirectory(source) else { throw CLIInstallError.incompleteInstallation }
-        for name in ["codex-home", "home", "xdg", "npm-home", "npm-cache"] {
+        for name in ["codex-home", "claude-config", "home", "xdg", "npm-home", "npm-cache", "tmp"] {
             let from = source.appendingPathComponent(name, isDirectory: true)
             guard fileManager.fileExists(atPath: from.path) else { continue }
             guard isRealDirectory(from) else { throw CLIInstallError.incompleteInstallation }
@@ -992,6 +1421,12 @@ struct CLIInstallService {
         return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
     }
 
+    private func isOwnedRegularFile(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 &&
+            (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == getuid()
+    }
+
     private func hasPrivatePermissions(_ url: URL, allowingOwnerMode: Int16) -> Bool {
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
               attributes[.type] as? FileAttributeType == .typeRegular ||
@@ -1002,6 +1437,7 @@ struct CLIInstallService {
     }
 
     private static let codexExecutableRelativePath = "package/node_modules/.bin/codex"
+    private static let claudeExecutableRelativePath = "package/node_modules/.bin/claude"
     private static let safariExecutablePath = "/Applications/Safari.app/Contents/MacOS/Safari"
 
     private struct InstallManifest: Codable {
@@ -1009,6 +1445,16 @@ struct CLIInstallService {
         let provider: String
         let package: String
         let executableRelativePath: String
+        let version: String?
+
+        init(registrationID: UUID, provider: String, package: String,
+             executableRelativePath: String, version: String? = nil) {
+            self.registrationID = registrationID
+            self.provider = provider
+            self.package = package
+            self.executableRelativePath = executableRelativePath
+            self.version = version
+        }
     }
 
     private func knownExecutables(for target: CLIDiscoveryTarget) -> [URL] {

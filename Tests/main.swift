@@ -12,18 +12,51 @@ func createSyntheticExecutable(_ url: URL, contents: String = "synthetic executa
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
 }
 
+func createUnixDomainSocket(at path: String) throws -> Int32 {
+    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { throw NSError(domain: "SyntheticSocket", code: Int(errno)) }
+    var address = sockaddr_un()
+    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    address.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(path.utf8) + [0]
+    let capacity = MemoryLayout.size(ofValue: address.sun_path)
+    guard pathBytes.count <= capacity else {
+        _ = close(descriptor)
+        throw NSError(domain: "SyntheticSocket", code: Int(ENAMETOOLONG))
+    }
+    withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+        pointer.withMemoryRebound(to: UInt8.self, capacity: capacity) { bytes in
+            for index in pathBytes.indices { bytes[index] = pathBytes[index] }
+        }
+    }
+    let result = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard result == 0 else {
+        let failure = errno
+        _ = close(descriptor)
+        throw NSError(domain: "SyntheticSocket", code: Int(failure))
+    }
+    return descriptor
+}
+
 final class SyntheticNPMRunner {
     private let lock = NSLock()
     private let exitCode: Int32
     private let createsExecutable: Bool
+    private let executableName: String
     private let entered: DispatchSemaphore?
     private let release: DispatchSemaphore?
     private var storedInvocations: [(URL, [String], [String: String])] = []
 
     init(exitCode: Int32 = 0, createsExecutable: Bool = true,
+         executableName: String = "codex",
          entered: DispatchSemaphore? = nil, release: DispatchSemaphore? = nil) {
         self.exitCode = exitCode
         self.createsExecutable = createsExecutable
+        self.executableName = executableName
         self.entered = entered
         self.release = release
     }
@@ -40,7 +73,7 @@ final class SyntheticNPMRunner {
         if createsExecutable, let prefixIndex = arguments.firstIndex(of: "--prefix"),
            arguments.indices.contains(prefixIndex + 1) {
             let prefix = URL(fileURLWithPath: arguments[prefixIndex + 1], isDirectory: true)
-            try createSyntheticExecutable(prefix.appendingPathComponent("node_modules/.bin/codex"))
+            try createSyntheticExecutable(prefix.appendingPathComponent("node_modules/.bin/\(executableName)"))
         }
         entered?.signal()
         if let release { _ = release.wait(timeout: .now() + .seconds(10)) }
@@ -535,6 +568,36 @@ require(storeAfterSymlinkFailure.contains(where: { $0.id == symlinkEntry.id }) &
 try fileManager.removeItem(at: symlinkRegistrationDirectory)
 _ = try registrationStore.remove(id: symlinkEntry.id)
 
+// A browser profile may contain an external IPC socket reference. Trash removes only
+// the UUID-owned symlink and preserves the external socket and neighboring data.
+let socketEntry = try registrationStore.add(provider: .codex).last!
+let socketRegistrationDirectory = codexInstallService.registrationDirectory(for: socketEntry)
+let browserProfile = socketRegistrationDirectory.appendingPathComponent(
+    "installation/codex-home/browser-profile", isDirectory: true)
+let externalSocket = URL(fileURLWithPath: "/tmp/pcli-\(UUID().uuidString.prefix(8)).sock")
+let externalSocketSentinel = testRoot.appendingPathComponent("external-browser-profile-sentinel")
+try fileManager.createDirectory(at: browserProfile, withIntermediateDirectories: true)
+try Data("preserve adjacent data".utf8).write(to: externalSocketSentinel)
+let socketDescriptor = try createUnixDomainSocket(at: externalSocket.path)
+defer {
+    _ = close(socketDescriptor)
+    _ = unlink(externalSocket.path)
+}
+try fileManager.createSymbolicLink(at: browserProfile.appendingPathComponent("SingletonSocket"),
+                                   withDestinationURL: externalSocket)
+var socketRecordRemoved = false
+try codexInstallService.removeRegistration(entry: socketEntry) {
+    socketRecordRemoved = true
+    _ = try registrationStore.remove(id: socketEntry.id)
+}
+var survivingSocketInfo = stat()
+let survivingSocketSentinel = try String(contentsOf: externalSocketSentinel, encoding: .utf8)
+require(socketRecordRemoved && !fileManager.fileExists(atPath: socketRegistrationDirectory.path) &&
+        lstat(externalSocket.path, &survivingSocketInfo) == 0 &&
+        (survivingSocketInfo.st_mode & S_IFMT) == S_IFSOCK &&
+        survivingSocketSentinel == "preserve adjacent data",
+        "trash unlinks the external socket reference but preserves the socket and external sentinel")
+
 let partialEntry = try registrationStore.add(provider: .codex).last!
 _ = try codexInstallService.install(entry: partialEntry)
 let partialDirectory = codexInstallService.registrationDirectory(for: partialEntry)
@@ -611,7 +674,154 @@ require(hostMarkerAfterRepeatedInstalls == hostMarkerBefore &&
         originalCodexAfterRepeatedInstalls == Data("synthetic executable".utf8),
         "multiple isolated installs leave global Codex state untouched")
 
-// Providers without an implemented installer remain unavailable and write nothing.
+// Claude auth status trusts only the documented method and UUID config directory.
+func claudeStatusJSON(_ method: String, configDirectory: String) -> Data {
+    try! JSONSerialization.data(withJSONObject: ["authMethod": method,
+                                                 "configDirectory": configDirectory])
+}
+let claudeConfigForParser = testRoot.appendingPathComponent("claude-status-config", isDirectory: true)
+require(ClaudeCLIAuthStatusDocument.parse(claudeStatusJSON("claude.ai", configDirectory: claudeConfigForParser.path))?
+            .status(expectedConfigDirectory: claudeConfigForParser) == .authenticated,
+        "Claude subscription login is accepted only for the expected config directory")
+require(ClaudeCLIAuthStatusDocument.parse(claudeStatusJSON("none", configDirectory: claudeConfigForParser.path))?
+            .status(expectedConfigDirectory: claudeConfigForParser) == .notAuthenticated,
+        "Claude auth status reports an explicit logged-out result")
+require(ClaudeCLIAuthStatusDocument.parse(claudeStatusJSON("api_key", configDirectory: claudeConfigForParser.path))?
+            .status(expectedConfigDirectory: claudeConfigForParser) == .unsupportedMethod,
+        "API key auth is not represented as an isolated Claude subscription login")
+require(ClaudeCLIAuthStatusDocument.parse(claudeStatusJSON("claude.ai", configDirectory: hostHome.path))?
+            .status(expectedConfigDirectory: claudeConfigForParser) == nil &&
+        ClaudeCLIAuthStatusDocument.parse(Data("{}".utf8)) == nil,
+        "mismatched config directories and malformed status are indeterminate")
+
+// Claude installation and operations use a synthetic npm/CLI runner only.
+let claudeSupport = testRoot.appendingPathComponent("claude-isolation-support")
+let claudeEntry = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 0)
+var claudeLoggedIn = false
+var claudeLoginLaunch: (URL, [String], [String: String])?
+let syntheticClaudeNPM = SyntheticNPMRunner(executableName: "claude")
+let claudeService = CLIInstallService(
+    applicationSupportDirectory: claudeSupport,
+    environment: ["PATH": localBin.path, "HOME": hostHome.path,
+                 "ANTHROPIC_API_KEY": "synthetic-host-api-key",
+                 "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-oauth-token",
+                 "NPM_TOKEN": "synthetic-npm-token"],
+    homeDirectory: hostHome,
+    additionalSearchDirectories: [],
+    knownExecutableOverrides: [:],
+    npmExecutableOverride: syntheticNPM,
+    nodeExecutableOverride: syntheticNode,
+    processRunner: { executable, arguments, environment in
+        try syntheticClaudeNPM.run(executable: executable, arguments: arguments, environment: environment)
+    },
+    outputRunner: { executable, arguments, environment in
+        if executable == syntheticNode {
+            return CLICommandOutput(status: 0, stdout: Data("v22.15.0\n".utf8))
+        }
+        if arguments == ["--version"] {
+            return CLICommandOutput(status: 0, stdout: Data("2.1.280 (Claude Code)\n".utf8))
+        }
+        if arguments == ["auth", "status", "--json"] {
+            return CLICommandOutput(status: claudeLoggedIn ? 0 : 1,
+                                    stdout: claudeStatusJSON(claudeLoggedIn ? "claude.ai" : "none",
+                                                             configDirectory: environment["CLAUDE_CONFIG_DIR"]!))
+        }
+        if arguments == ["auth", "logout"] {
+            claudeLoggedIn = false
+            return CLICommandOutput(status: 0, stdout: Data())
+        }
+        fatalError("unexpected synthetic Claude CLI command: \(arguments)")
+    },
+    safariAvailableOverride: true,
+    authenticationProcessLauncher: { executable, arguments, environment, _, output in
+        claudeLoginLaunch = (executable, arguments, environment)
+        let process = Process()
+        process.standardOutput = output
+        return process
+    })
+require(claudeService.registrationInstallStatus(for: claudeEntry) == .notInstalled,
+        "Claude is not mistaken for the system-global CLI")
+let installedClaudeURL = try claudeService.install(entry: claudeEntry)
+require(installedClaudeURL == claudeService.managedExecutableURL(for: claudeEntry) &&
+        claudeService.registrationInstallStatus(for: claudeEntry) == .installed,
+        "Claude package installs and validates only inside its UUID")
+let claudeSiblingEntry = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 1)
+_ = try claudeService.install(entry: claudeSiblingEntry)
+let claudePrimaryConfigDirectory = try claudeService.isolatedClaudeRuntimeEnvironment(for: claudeEntry)["CLAUDE_CONFIG_DIR"]
+let claudeSiblingRuntime = try claudeService.isolatedClaudeRuntimeEnvironment(for: claudeSiblingEntry)
+require(claudeService.registrationInstallStatus(for: claudeSiblingEntry) == .installed &&
+        claudeSiblingRuntime["CLAUDE_CONFIG_DIR"] != nil &&
+        claudeSiblingRuntime["CLAUDE_CONFIG_DIR"] != claudePrimaryConfigDirectory &&
+        claudeService.managedExecutableURL(for: claudeSiblingEntry) != installedClaudeURL,
+        "two Claude registrations receive distinct executable and credential-directory roots")
+let claudeInstallCall = syntheticClaudeNPM.invocations.last!
+require(claudeInstallCall.1.suffix(1).first == "@anthropic-ai/claude-code@latest" &&
+        claudeInstallCall.1.contains("--prefix") &&
+        claudeInstallCall.2["HOME"] != hostHome.path &&
+        claudeInstallCall.2["NPM_CONFIG_PREFIX"]?.contains(claudeSiblingEntry.id.uuidString) == true &&
+        claudeInstallCall.2["NPM_TOKEN"] == nil,
+        "Claude npm install is fixed-source, prefix-scoped, and excludes host secrets")
+let claudeRuntime = try claudeService.isolatedClaudeRuntimeEnvironment(for: claudeEntry)
+require(claudeRuntime["HOME"] != hostHome.path &&
+        claudeRuntime["CLAUDE_CONFIG_DIR"]?.contains(claudeEntry.id.uuidString) == true &&
+        claudeRuntime["ANTHROPIC_API_KEY"] == nil && claudeRuntime["CLAUDE_CODE_OAUTH_TOKEN"] == nil &&
+        claudeRuntime["NPM_TOKEN"] == nil && claudeRuntime["DISABLE_UPDATES"] == "1",
+        "Claude runtime uses UUID config and drops inherited credentials and updates")
+let claudeInitialAuthStatus = try claudeService.claudeAuthenticationStatus(for: claudeEntry)
+require(claudeInitialAuthStatus == .notAuthenticated,
+        "Claude auth status comes from the isolated CLI JSON result")
+let fakeClaudeLogin = try claudeService.startClaudeAuthentication(for: claudeEntry)
+require(claudeLoginLaunch?.1 == ["auth", "login"] &&
+        claudeLoginLaunch?.2["CLAUDE_CONFIG_DIR"] == claudeRuntime["CLAUDE_CONFIG_DIR"] &&
+        claudeLoginLaunch?.2["BROWSER"]?.contains("Safari") == true &&
+        claudeLoginLaunch?.2["ANTHROPIC_API_KEY"] == nil,
+        "Claude browser login launches the official command with UUID configuration only")
+do {
+    _ = try claudeService.logoutClaude(for: claudeEntry)
+    fatalError("the active Claude login lease must block logout")
+} catch CLIInstallError.installationInProgress {
+}
+fakeClaudeLogin.releaseOperationLock()
+claudeLoggedIn = true
+let claudeSignedInAuthStatus = try claudeService.claudeAuthenticationStatus(for: claudeEntry)
+require(claudeSignedInAuthStatus == .authenticated,
+        "Claude authenticated UI state requires authMethod claude.ai")
+let claudePostLogoutStatus = try claudeService.logoutClaude(for: claudeEntry)
+require(claudePostLogoutStatus == .notAuthenticated && !claudeLoggedIn,
+        "Claude logout runs the official local CLI command and verifies status afterward")
+let claudeRetainedConfig = claudeService.registrationDirectory(for: claudeEntry)
+    .appendingPathComponent("installation/claude-config/settings.json")
+try Data("synthetic settings".utf8).write(to: claudeRetainedConfig)
+try claudeService.uninstall(entry: claudeEntry)
+require(claudeService.registrationInstallStatus(for: claudeEntry) == .notInstalled &&
+        fileManager.fileExists(atPath: claudeRetainedConfig.path),
+        "Claude uninstall removes the package while retaining UUID settings and login data")
+var claudeRecordRemoved = false
+do {
+    try claudeService.removeRegistration(entry: claudeEntry) { claudeRecordRemoved = true }
+    fatalError("Claude trash must not leave a config-directory-keyed Keychain item")
+} catch CLIInstallError.claudeReinstallRequiredForKeychainCleanup {
+}
+require(!claudeRecordRemoved && fileManager.fileExists(atPath: claudeRetainedConfig.path),
+        "Claude trash preserves the row and data if its Keychain credential cannot be safely cleaned")
+_ = try claudeService.install(entry: claudeEntry)
+claudeLoggedIn = true
+try claudeService.removeRegistration(entry: claudeEntry) { claudeRecordRemoved = true }
+require(claudeRecordRemoved && !claudeLoggedIn &&
+        !fileManager.fileExists(atPath: claudeService.registrationDirectory(for: claudeEntry).path),
+        "Claude trash cleans the UUID-keyed credential before deleting UUID-local data")
+require(claudeService.registrationInstallStatus(for: claudeSiblingEntry) == .installed,
+        "trashing one Claude UUID leaves its sibling package and auth root untouched")
+try claudeService.removeRegistration(entry: claudeSiblingEntry) { }
+let ordinalClaudeZero = try registrationStore.add(provider: .claude).last!
+_ = try registrationStore.remove(id: ordinalClaudeZero.id)
+let replacementClaudeZero = try registrationStore.add(provider: .claude).last!
+require(ordinalClaudeZero.ordinal == 0 && replacementClaudeZero.ordinal == 0 &&
+        ordinalClaudeZero.id != replacementClaudeZero.id &&
+        claudeService.registrationInstallStatus(for: replacementClaudeZero) == .notInstalled,
+        "reusing a Claude ordinal allocates a fresh UUID with no inherited installation")
+
+// Antigravity remains a catalog entry without a registration installer in this scope.
 let unsupportedSupport = testRoot.appendingPathComponent("unsupported-support")
 let unsupportedService = CLIInstallService(applicationSupportDirectory: unsupportedSupport,
                                            environment: installEnvironment,
@@ -621,10 +831,10 @@ let unsupportedService = CLIInstallService(applicationSupportDirectory: unsuppor
                                            npmExecutableOverride: syntheticNPM,
                                            nodeExecutableOverride: syntheticNode,
                                            processRunner: { _, _, _ in fatalError("unsupported providers must not run npm") })
-for provider in [CLIProvider.claude, .antigravity] {
+for provider in [CLIProvider.antigravity] {
     let unsupportedEntry = CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: 0)
     require(unsupportedService.registrationInstallStatus(for: unsupportedEntry) == .unsupported,
-            "Claude and Antigravity do not display a false installed state")
+            "Antigravity does not display a false installed state")
     do {
         _ = try unsupportedService.install(entry: unsupportedEntry)
         fatalError("unsupported provider installation should be rejected")
@@ -895,4 +1105,4 @@ do {
             "failed migration preserves the original file")
 }
 
-print("CLI catalog migration, discovery, and isolated Codex installer tests passed")
+print("CLI catalog migration, discovery, and isolated Codex/Claude installer tests passed")

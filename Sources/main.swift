@@ -486,21 +486,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.isBordered = false
                 account.tag = index
                 let isManualEntry = entry.manualEntry != nil
-                let codexRegistration = entry.manualEntry.flatMap {
-                    $0.provider == CLIProvider.codex.rawValue ? $0 : nil
+                let managedRegistration = entry.manualEntry.flatMap {
+                    ($0.provider == CLIProvider.codex.rawValue || $0.provider == CLIProvider.claude.rawValue) ? $0 : nil
                 }
-                let authState = codexRegistration.map { authenticationUIState(for: $0) }
-                let canCancelLogin = codexRegistration.map {
+                let authState = managedRegistration.map { authenticationUIState(for: $0) }
+                let canCancelLogin = managedRegistration.map {
                     isAuthenticationRunningState(authenticationUIState(for: $0)) &&
                     authenticationProcesses[$0.id]?.isRunning == true
                 } ?? false
-                let canStartLogin = codexRegistration.map { canStartAuthentication(for: $0) } ?? false
-                let installState = codexRegistration.map { registrationInstallState(for: $0) }
+                let canStartLogin = managedRegistration.map { canStartAuthentication(for: $0) } ?? false
+                let installState = managedRegistration.map { registrationInstallState(for: $0) }
                 let isAuthenticated = authState == .authenticated
                 account.target = self
                 account.action = isAuthenticated ? #selector(logoutCLI(_:)) : #selector(loginCLI(_:))
                 account.isEnabled = !storageLoadFailed &&
-                    (codexRegistration.map { !activeRemovalIDs.contains($0.id) } ?? true) &&
+                    (managedRegistration.map { !activeRemovalIDs.contains($0.id) } ?? true) &&
                     (canCancelLogin || (installState == .installed && (isAuthenticated || canStartLogin)))
                 account.contentTintColor = account.isEnabled
                     ? ((canCancelLogin || isAuthenticated) ? .systemOrange : .systemGreen)
@@ -523,10 +523,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     account.toolTip = "Instale este cadastro para verificar ou alterar seu login; dados locais existentes são preservados."
                     account.setAccessibilityLabel("Login indisponível enquanto \(entry.displayName) não está instalado")
                 } else {
-                    account.toolTip = codexRegistration == nil
-                        ? "Login disponível somente para um Codex instalado neste cadastro"
+                    account.toolTip = managedRegistration == nil
+                        ? "Login disponível somente para um CLI instalado neste cadastro"
                         : "Entrar pelo navegador neste cadastro"
-                    account.setAccessibilityLabel(codexRegistration == nil
+                    account.setAccessibilityLabel(managedRegistration == nil
                         ? "Login indisponível para \(entry.displayName)"
                         : "Entrar pelo navegador em \(entry.displayName)")
                 }
@@ -572,10 +572,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let textTrailing = actions.leadingAnchor
                 if let manualEntry = entry.manualEntry,
-                   manualEntry.provider == CLIProvider.codex.rawValue {
+                   manualEntry.provider == CLIProvider.codex.rawValue ||
+                    manualEntry.provider == CLIProvider.claude.rawValue {
                     let install = makeInstallButton(displayName: entry.displayName, tag: index)
                     let state = registrationInstallState(for: manualEntry)
                     let isInstalled = state == .installed
+                    let providerName = CLIProvider(rawValue: manualEntry.provider)?.catalogTitle ?? manualEntry.provider
                     let actionSymbol: String
                     if isInstalled {
                         actionSymbol = "shippingbox"
@@ -597,8 +599,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         ? "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados; isso não encerra a sessão."
                         : state.displayText
                     install.setAccessibilityLabel(isInstalled
-                        ? "Desinstalar Codex gerenciado de \(entry.displayName)"
-                        : "Instalar Codex em \(entry.displayName)")
+                        ? "Desinstalar \(providerName) gerenciado de \(entry.displayName)"
+                        : "Instalar \(providerName) em \(entry.displayName)")
                     install.setAccessibilityValue(state.displayText)
                     applyActionAppearance(install)
                     install.translatesAutoresizingMaskIntoConstraints = false
@@ -671,19 +673,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func canStartAuthentication(for entry: CLIEntry) -> Bool {
-        guard installService?.registrationInstallStatus(for: entry) == .installed,
+        guard (entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue),
+              installService?.registrationInstallStatus(for: entry) == .installed,
               !activeRemovalIDs.contains(entry.id),
               !checkingAuthenticationIDs.contains(entry.id),
               authenticationProcesses[entry.id]?.isRunning != true else { return false }
         switch authenticationUIState(for: entry) {
         case .notAuthenticated, .failed, .cancelled: return true
-        case .checking, .starting, .awaitingBrowserAuthorization, .loggingOut, .authenticated, .statusError: return false
+        case .checking, .starting, .awaitingBrowserAuthorization, .awaitingClaudeBrowser,
+             .loggingOut, .authenticated, .statusError: return false
         }
     }
 
     private func isAuthenticationRunningState(_ state: CLIAuthenticationUIState) -> Bool {
         switch state {
-        case .starting, .awaitingBrowserAuthorization, .loggingOut: return true
+        case .starting, .awaitingBrowserAuthorization, .awaitingClaudeBrowser, .loggingOut: return true
         case .checking, .notAuthenticated, .authenticated, .failed, .statusError, .cancelled: return false
         }
     }
@@ -697,7 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func canInstall(_ entry: CLIEntry) -> Bool {
         guard !storageLoadFailed,
-              entry.provider == CLIProvider.codex.rawValue,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
               installService != nil,
               !installingRegistrationIDs.contains(entry.id),
               !activeLogoutIDs.contains(entry.id),
@@ -706,7 +710,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func canUninstall(_ entry: CLIEntry) -> Bool {
-        guard !storageLoadFailed, entry.provider == CLIProvider.codex.rawValue,
+        guard !storageLoadFailed,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
               !installingRegistrationIDs.contains(entry.id),
               !activeLogoutIDs.contains(entry.id),
               !activeRemovalIDs.contains(entry.id),
@@ -739,16 +744,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshAuthenticationStatuses() {
         guard let service = installService else { return }
-        for entry in entries where entry.provider == CLIProvider.codex.rawValue {
+        for entry in entries where entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue {
             guard service.registrationInstallStatus(for: entry) == .installed,
                   checkingAuthenticationIDs.insert(entry.id).inserted else { continue }
             authenticationStates[entry.id] = .checking
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let state: CLIAuthenticationUIState
                 do {
-                    switch try service.authenticationStatus(for: entry) {
-                    case .authenticated: state = .authenticated
-                    case .notAuthenticated: state = .notAuthenticated
+                    if entry.provider == CLIProvider.claude.rawValue {
+                        switch try service.claudeAuthenticationStatus(for: entry) {
+                        case .authenticated: state = .authenticated
+                        case .notAuthenticated: state = .notAuthenticated
+                        case .unsupportedMethod: state = .statusError(
+                            "O método de login não é compatível com o isolamento deste cadastro.")
+                        }
+                    } else {
+                        switch try service.authenticationStatus(for: entry) {
+                        case .authenticated: state = .authenticated
+                        case .notAuthenticated: state = .notAuthenticated
+                        }
                     }
                 } catch let error as CLIInstallError {
                     state = .statusError(error.errorDescription ?? "Não foi possível verificar o login.")
@@ -775,14 +789,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               !isAuthenticationRunningState(authenticationUIState(for: entry)),
               authenticationProcesses[entry.id]?.isRunning != true else { return }
 
-        let isManagedCodex = entry.provider == CLIProvider.codex.rawValue
-        guard !isManagedCodex || installService != nil else { return }
+        let isManagedRegistration = entry.provider == CLIProvider.codex.rawValue ||
+            entry.provider == CLIProvider.claude.rawValue
+        guard !isManagedRegistration || installService != nil else { return }
         let service = installService
         let alert = NSAlert()
         alert.messageText = "Remover definitivamente \(entry.displayName)?"
-        alert.informativeText = isManagedCodex
-            ? "Esta ação apagará o CLI gerenciado deste cadastro, suas configurações, histórico, caches e login local. Não pode ser desfeita. Instalações globais e outros cadastros não serão alterados; não será enviado logout nem revogada uma sessão remota."
-            : "Esta ação removerá o cadastro \(entry.displayName) da lista. Não pode ser desfeita e não altera instalações detectadas ou globais."
+        if entry.provider == CLIProvider.claude.rawValue {
+            alert.informativeText = "Esta ação apagará o pacote Claude Code gerenciado, configuração, histórico, caches e credenciais locais deste UUID. Não pode ser desfeita. O logout oficial pode invalidar a credencial no provedor, mas não garante revogar todas as sessões remotas. Instalações globais e outros cadastros não serão alterados."
+        } else if isManagedRegistration {
+            alert.informativeText = "Esta ação apagará o CLI gerenciado deste cadastro, suas configurações, histórico, caches e login local. Não pode ser desfeita. Instalações globais e outros cadastros não serão alterados; não será enviado logout nem revogada uma sessão remota."
+        } else {
+            alert.informativeText = "Esta ação removerá o cadastro \(entry.displayName) da lista. Não pode ser desfeita e não altera instalações detectadas ou globais."
+        }
         alert.alertStyle = .critical
         let cancelButton = alert.addButton(withTitle: "Cancelar")
         cancelButton.keyEquivalent = "\r"
@@ -795,7 +814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<Void, Error>
             do {
-                if isManagedCodex {
+                if isManagedRegistration {
                     guard let service else { throw CLIInstallError.unsupportedProvider }
                     try service.removeRegistration(entry: entry) {
                         _ = try entryStore.remove(id: entry.id)
@@ -815,7 +834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .success:
                     self.showRegistrationRemovalResult(
                         title: "Cadastro removido",
-                        message: isManagedCodex
+                        message: isManagedRegistration
                             ? "O pacote e os dados locais deste UUID foram apagados. A ação Desinstalar preserva o cadastro; a lixeira remove ambos. Nenhuma sessão remota foi revogada."
                             : "O cadastro foi removido. Instalações detectadas e globais não foram alteradas.")
                 case .failure(let error):
@@ -841,7 +860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !storageLoadFailed, let service = installService,
               listItems.indices.contains(sender.tag),
               let entry = listItems[sender.tag].manualEntry,
-              entry.provider == CLIProvider.codex.rawValue,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
               canInstall(entry),
               installingRegistrationIDs.insert(entry.id).inserted else { return }
 
@@ -877,7 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !storageLoadFailed, let service = installService,
               listItems.indices.contains(sender.tag),
               let entry = listItems[sender.tag].manualEntry,
-              entry.provider == CLIProvider.codex.rawValue,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
               service.registrationInstallStatus(for: entry) == .installed else { return }
 
         if isAuthenticationRunningState(authenticationStates[entry.id] ?? .notAuthenticated),
@@ -889,6 +908,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard canStartAuthentication(for: entry) else { return }
+        if entry.provider == CLIProvider.claude.rawValue {
+            startClaudeLogin(for: entry, service: service)
+            return
+        }
         cancelledAuthenticationIDs.remove(entry.id)
         authenticationStates[entry.id] = .starting
         render(.settings)
@@ -1010,6 +1033,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func startClaudeLogin(for entry: CLIEntry, service: CLIInstallService) {
+        cancelledAuthenticationIDs.remove(entry.id)
+        authenticationStates[entry.id] = .starting
+        render(.settings)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let session = try service.startClaudeAuthentication(for: entry)
+                let process = session.process
+                DispatchQueue.main.async {
+                    guard let self else { process.terminate(); return }
+                    self.authenticationProcesses[entry.id] = process
+                    self.authenticationStates[entry.id] = .awaitingClaudeBrowser
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+                let drained = DispatchGroup()
+                drained.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    defer { drained.leave() }
+                    while !session.output.fileHandleForReading.readData(ofLength: 4096).isEmpty {}
+                }
+                process.waitUntilExit()
+                drained.wait()
+                session.releaseOperationLock()
+                let verified: Result<ClaudeCLIAuthenticationStatus, Error>
+                do { verified = .success(try service.claudeAuthenticationStatus(for: entry)) }
+                catch { verified = .failure(error) }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.authenticationProcesses.removeValue(forKey: entry.id)
+                    switch verified {
+                    case .success(.authenticated): self.authenticationStates[entry.id] = .authenticated
+                    case .success(.notAuthenticated) where self.cancelledAuthenticationIDs.remove(entry.id) != nil:
+                        self.authenticationStates[entry.id] = .cancelled
+                    case .success(.notAuthenticated):
+                        self.authenticationStates[entry.id] = .failed(
+                            "O fluxo oficial terminou sem confirmar a autenticação neste cadastro.")
+                    case .success(.unsupportedMethod):
+                        self.authenticationStates[entry.id] = .statusError(
+                            "O método de login não é compatível com o isolamento deste cadastro.")
+                    case .failure:
+                        self.authenticationStates[entry.id] = .statusError(
+                            "O estado do login não pôde ser confirmado após o fluxo oficial.")
+                    }
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.authenticationStates[entry.id] = .failed(error.localizedDescription)
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+            }
+        }
+    }
+
     @objc private func logoutCLI(_ sender: NSButton) {
         guard !storageLoadFailed, let service = installService,
               listItems.indices.contains(sender.tag),
@@ -1022,7 +1100,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let alert = NSAlert()
         alert.messageText = "Sair deste cadastro?"
-        alert.informativeText = "A CLI vai limpar as credenciais locais deste cadastro (CODEX_HOME). Isso não revoga a sessão remotamente."
+        alert.informativeText = entry.provider == CLIProvider.claude.rawValue
+            ? "A CLI executará o logout oficial usando somente a configuração deste UUID. O provedor pode invalidar a credencial; esta ação não garante a revogação de todas as sessões remotas."
+            : "A CLI vai limpar as credenciais locais deste cadastro (CODEX_HOME). Isso não revoga a sessão remotamente."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Sair")
         alert.addButton(withTitle: "Cancelar")
@@ -1033,9 +1113,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         render(.settings)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<CLIAuthenticationStatus, Error>
-            do { result = .success(try service.logout(for: entry)) }
+            do {
+                if entry.provider == CLIProvider.claude.rawValue {
+                    let status = try service.logoutClaude(for: entry)
+                    result = .success(status == .authenticated ? .authenticated : .notAuthenticated)
+                } else {
+                    result = .success(try service.logout(for: entry))
+                }
+            }
             catch { result = .failure(error) }
-            let verifiedStatus = try? service.authenticationStatus(for: entry)
+            let verifiedStatus: CLIAuthenticationStatus?
+            if entry.provider == CLIProvider.claude.rawValue {
+                do {
+                    switch try service.claudeAuthenticationStatus(for: entry) {
+                    case .authenticated: verifiedStatus = .authenticated
+                    case .notAuthenticated: verifiedStatus = .notAuthenticated
+                    case .unsupportedMethod: verifiedStatus = nil
+                    }
+                } catch { verifiedStatus = nil }
+            } else {
+                verifiedStatus = try? service.authenticationStatus(for: entry)
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.activeLogoutIDs.remove(entry.id)
@@ -1060,8 +1158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               canUninstall(entry), !activeLogoutIDs.contains(entry.id) else { return }
 
         let alert = NSAlert()
-        alert.messageText = "Desinstalar o Codex deste cadastro?"
-        alert.informativeText = "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados. Esta ação não encerra nem revoga uma sessão."
+        let providerName = CLIProvider(rawValue: entry.provider)?.catalogTitle ?? entry.provider
+        alert.messageText = "Desinstalar \(providerName) deste cadastro?"
+        alert.informativeText = "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados. Esta ação não encerra a sessão nem garante revogação remota."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Desinstalar")
         alert.addButton(withTitle: "Cancelar")

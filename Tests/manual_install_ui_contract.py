@@ -45,7 +45,7 @@ if "removeRecord()" not in removal_service or removal_service.find("removeRecord
 if "func startAuthentication" in installer and "operationLock: operationLock" not in installer:
     failures.append("browser authentication does not hold the UUID lock for the active process lifetime")
 
-row_start = source.find("if let manualEntry = entry.manualEntry,\n                   manualEntry.provider == CLIProvider.codex.rawValue {")
+row_start = source.find("if let manualEntry = entry.manualEntry,\n                   manualEntry.provider == CLIProvider.codex.rawValue ||")
 row_end = source.find("\n                }\n                let separator", row_start)
 row = source[row_start:row_end] if row_start >= 0 and row_end > row_start else ""
 for expected, message in [
@@ -62,6 +62,14 @@ if 'NSButton(title: "Instalar"' in source or 'title: "Código"' in source:
     failures.append("install controls are not icons-only or the removed Code route remains visible")
 if "service.uninstall(entry: entry)" not in source or "service.logout(for: entry)" not in source:
     failures.append("UUID-scoped uninstall and logout service operations are not wired")
+if "service.logoutClaude(for: entry)" not in source or "service.startClaudeAuthentication(for: entry)" not in source:
+    failures.append("Claude official auth login/logout are not wired to its UUID-scoped service")
+if '"auth", "status", "--json"' not in installer or '"auth", "logout"' not in installer:
+    failures.append("Claude status/logout do not use the documented noninteractive CLI commands")
+if '"CLAUDE_CONFIG_DIR": paths.config.path' not in installer or "claude-config" not in installer:
+    failures.append("Claude settings, credentials, and history are not assigned a UUID config directory")
+if '@anthropic-ai/claude-code@latest' not in installer or '"--prefix"' not in installer:
+    failures.append("Claude package install is not pinned to the owned local npm prefix")
 if "service.startAuthentication(for: entry)" not in source:
     failures.append("login does not use the isolated browser-based app-server flow")
 if "logoutCLI(_:)" not in source or "authState == .authenticated" not in source:

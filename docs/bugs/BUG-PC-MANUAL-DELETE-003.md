@@ -1,7 +1,7 @@
 # BUG-PC-MANUAL-DELETE-003 — lixeira remove cadastro sem desinstalar o CLI
 
 - Reportado durante validação funcional em 2026-10-16.
-- Estado: fluxo básico validado no build `0.0.0.29`; follow-up de auditoria aberto em 2026-10-16 para um socket Unix do perfil de browser.
+- Estado: correção inicial validada no build `0.0.0.29`; follow-up do socket Unix corrigido e coberto por teste sintético no build `0.0.0.31`.
 - Escopo: ação de lixeira em cadastro manual CodexCLI. A ação separada Desinstalar mantém o cadastro e os dados locais.
 
 ## Reprodução e causa
@@ -43,11 +43,11 @@ EVIDENCE: `DadosTeste/2083-PainelCli-readonly-codex-audit/audit-report.txt`.
 FILES_RELATED: `Sources/CLIInstaller.swift` (`removeRegistration`, `symlinksStayInside`).
 CONSTRAINTS: auditoria autorizada somente leitura; sem alteração nas três instalações, sem browser, sem login/logout, sem CLI global, sem build adicional e sem teste destrutivo.
 ACCEPTANCE_FOR_FIX: adicionar fixture sintética em diretório temporário contendo symlink externo para socket Unix do usuário e sentinel externo: a lixeira deve remover só o UUID e o link, preservar o socket/sentinel; manter a recusa para symlink externo de arquivo/diretório, validar falha parcial e save, executar regressões/CI e retestar em uma tarefa de correção autorizada.
-REGRESSION_TEST: pendente — fixture discriminante antes da correção; não executada nesta auditoria para respeitar o limite de somente leitura/sem novo build.
+REGRESSION_TEST: fixture sintética discriminante executada antes e depois da correção, preservando socket/sentinel externo e removendo o cadastro UUID; symlink externo para arquivo/diretório continua recusado.
 INITIAL_STATE: instalação real CodexCLI 0, pacote/config/auth privados e autenticada; um socket IPC em `browser-profile` é a única referência symlink observada fora do UUID.
 TEST_COMMAND: auditoria isolada `--version` e `login status` executada uma vez em cada UUID, mais inspeção de metadata/path sem ações mutantes; saída integral de CLI nunca foi persistida.
-BEFORE_FIX: audit follow-up observado no `.29`; comportamento do handler foi estabelecido por inspeção do código, sem acionar a lixeira. Log sanitizado no pacote de evidência acima.
-AFTER_FIX: N/D — não corrigido nesta tarefa.
-AFFECTED_SUITE: N/D nesta auditoria; os testes sintéticos existentes verificam recusa de symlink externo, não o caso de symlink para socket.
-AUTOMATION_LIMITATIONS: teste automatizado e correção ficam para tarefa autorizada; nenhuma remoção/login/logout real foi realizada.
-RETEST_VERDICT: N/D.
+BEFORE_FIX: a fixture falhou com `incompleteInstallation` ao testar temporariamente o verificador estrito anterior; o processo de teste interrompido foi limpo e o fixture agora usa `defer` para limpar o socket mesmo em falhas. Evidência sanitizada no pacote `2084-PainelCli-ClaudeCLI-UUID-20261016`.
+AFTER_FIX: `scripts/ci-check.sh` passou com a fixture de socket e todas as regressões Codex/Claude; `git diff --check` passou. Bundle `0.0.0.31` compilado/aberto, assinatura local validada, bundles atual/anterior verificados e uma instância em execução. Evidência sanitizada no pacote `2084-PainelCli-ClaudeCLI-UUID-20261016`.
+AFFECTED_SUITE: `scripts/ci-check.sh` (suite sintética de installer/catalog/UI); o teste discriminante comprova que a fixture dá erro antes da mudança e passa depois.
+AUTOMATION_LIMITATIONS: fixture usa um socket Unix temporário sintético; nenhuma remoção em cadastro real, login/logout, CLI/npm real, Keychain ou navegador foi realizada.
+RETEST_VERDICT: PASS sintético; requer reteste funcional humano no registro CodexCLI real, conforme o plano autorizado, antes de validar qualquer efeito de login/logout real.
