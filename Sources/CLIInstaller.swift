@@ -94,7 +94,7 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case commandTimedOut
     case authenticationPolicyBlocked
     case authenticationStorageUnavailable
-    case chromeUnavailable
+    case browserUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -118,8 +118,8 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "A política local não confirma armazenamento de credenciais isolado em arquivo; login bloqueado."
         case .authenticationStorageUnavailable:
             return "O login não pôde ser confirmado no arquivo privado deste cadastro."
-        case .chromeUnavailable:
-            return "Não encontrei o Google Chrome para abrir o login neste perfil isolado."
+        case .browserUnavailable:
+            return "Não encontrei o Safari para abrir o fluxo oficial de login."
         }
     }
 }
@@ -143,7 +143,7 @@ enum CLIAuthenticationUIState: Equatable {
         case .checking: return "Verificando login isolado…"
         case .notAuthenticated: return "Login não configurado neste cadastro"
         case .starting: return "Iniciando login isolado…"
-        case .awaitingUserCode(let code): return "No Chrome isolado, confirme com o código: \(code)"
+        case .awaitingUserCode(let code): return "No Safari, confirme com o código: \(code)"
         case .authenticated: return "Autenticado neste cadastro"
         case .failed(let message): return "Falha no login isolado · \(message)"
         case .cancelled: return "Login isolado cancelado"
@@ -470,8 +470,8 @@ struct CLIInstallService {
             throw CLIInstallError.incompleteInstallation
         }
         try validateAuthenticationPolicy(for: entry)
-        guard fileManager.fileExists(atPath: Self.chromeExecutablePath) else {
-            throw CLIInstallError.chromeUnavailable
+        guard fileManager.fileExists(atPath: Self.safariExecutablePath) else {
+            throw CLIInstallError.browserUnavailable
         }
         let output = Pipe()
         let process = try authenticationProcessLauncher(managedExecutableURL(for: entry),
@@ -480,29 +480,23 @@ struct CLIInstallService {
         return CLIAuthenticationSession(process: process, output: output)
     }
 
-    func openDeviceAuthenticationBrowser(for entry: CLIEntry, verificationURL: URL) throws -> Bool {
+    func openDeviceAuthenticationPage(for entry: CLIEntry, verificationURL: URL) throws -> Bool {
         guard verificationURL.scheme == "https",
               verificationURL.host == "auth.openai.com",
               verificationURL.path == "/codex/device",
-              fileManager.fileExists(atPath: Self.chromeExecutablePath) else {
-            throw CLIInstallError.chromeUnavailable
+              fileManager.fileExists(atPath: Self.safariExecutablePath) else {
+            throw CLIInstallError.browserUnavailable
         }
-        let profile = installationRoot(for: entry).appendingPathComponent("codex-home/browser-profile", isDirectory: true)
-        try fileManager.createDirectory(at: profile, withIntermediateDirectories: true)
-        try setPrivatePermissions(profile)
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-na", "/Applications/Google Chrome.app", "--args",
-                          "--user-data-dir=\(profile.path)", "--no-first-run",
-                          "--no-default-browser-check", "--new-window", verificationURL.absoluteString]
+        open.arguments = ["-a", "/Applications/Safari.app", verificationURL.absoluteString]
         open.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
         open.standardInput = FileHandle.nullDevice
         open.standardOutput = FileHandle.nullDevice
         open.standardError = FileHandle.nullDevice
         try open.run()
         open.waitUntilExit()
-        guard open.terminationStatus == 0 else { return false }
-        return waitForChromeProfile(profile, timeout: 10)
+        return open.terminationStatus == 0
     }
 
     static func deviceCodePrompt(in output: String) -> CLIDeviceCodePrompt? {
@@ -515,30 +509,6 @@ struct CLIInstallService {
         guard code.range(of: "^[A-Z0-9-]{6,24}$", options: .regularExpression) != nil,
               let url = URL(string: "https://auth.openai.com/codex/device") else { return nil }
         return CLIDeviceCodePrompt(verificationURL: url, code: code)
-    }
-
-    private func waitForChromeProfile(_ profile: URL, timeout: TimeInterval) -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let ps = Process()
-            let output = Pipe()
-            ps.executableURL = URL(fileURLWithPath: "/bin/ps")
-            ps.arguments = ["-axo", "command="]
-            ps.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
-            ps.standardOutput = output
-            ps.standardError = FileHandle.nullDevice
-            ps.standardInput = FileHandle.nullDevice
-            guard (try? ps.run()) != nil else { return false }
-            let commands = output.fileHandleForReading.readDataToEndOfFile()
-            ps.waitUntilExit()
-            if ps.terminationStatus == 0,
-               let listing = String(data: commands, encoding: .utf8),
-               listing.components(separatedBy: .newlines).contains(where: {
-                   $0.contains("Google Chrome") && $0.contains("--user-data-dir=\(profile.path)")
-               }) { return true }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        return false
     }
 
     /// Admin-enforced credential policies outrank the instance config. Inspect only the
@@ -693,7 +663,7 @@ struct CLIInstallService {
     }
 
     private static let codexExecutableRelativePath = "package/node_modules/.bin/codex"
-    private static let chromeExecutablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    private static let safariExecutablePath = "/Applications/Safari.app/Contents/MacOS/Safari"
 
     private struct InstallManifest: Codable {
         let registrationID: UUID

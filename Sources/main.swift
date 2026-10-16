@@ -766,7 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         let alreadyOpened = browserOpened
                         promptLock.unlock()
                         guard !alreadyOpened else { continue }
-                        let opened = (try? service.openDeviceAuthenticationBrowser(
+                        let opened = (try? service.openDeviceAuthenticationPage(
                             for: entry, verificationURL: prompt.verificationURL)) == true
                         promptLock.lock()
                         browserOpened = opened
@@ -777,7 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             if opened {
                                 self.authenticationStates[entry.id] = .awaitingUserCode(prompt.code)
                             } else {
-                                self.authenticationStates[entry.id] = .failed("O Chrome não confirmou o perfil isolado; o login foi interrompido.")
+                                self.authenticationStates[entry.id] = .failed("O Safari não aceitou a página oficial; o login foi interrompido.")
                                 if process.isRunning { process.terminate() }
                             }
                             if self.settingsButton.state == .on { self.render(.settings) }
@@ -798,7 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     } else if self.cancelledAuthenticationIDs.remove(entry.id) != nil {
                         self.authenticationStates[entry.id] = .cancelled
                     } else if !confirmedBrowser {
-                        self.authenticationStates[entry.id] = .failed("A CLI não disponibilizou um código de acesso para abrir no Chrome isolado.")
+                        self.authenticationStates[entry.id] = .failed("A CLI não disponibilizou um código de acesso para abrir no Safari.")
                     } else if process.terminationStatus == 0 {
                         self.authenticationStates[entry.id] = .failed("A CLI encerrou sem confirmar a autenticação.")
                     } else {
