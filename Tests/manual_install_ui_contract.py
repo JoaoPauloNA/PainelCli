@@ -37,7 +37,8 @@ login_handler = source[login_handler_start:login_handler_end] if login_handler_s
 for expected, description in [
     ("entry.provider == CLIProvider.codex.rawValue", "login handler is not limited to a manual Codex registration"),
     ("service.registrationInstallStatus(for: entry) == .installed", "login can run before this UUID installation validates"),
-    ("service.startAuthentication(for: entry)", "login handler does not use the isolated official CLI flow"),
+    ("service.startAuthentication(for: entry, mode: mode)", "login handler does not use the isolated official CLI app-server"),
+    ("@objc private func loginCLIWithDeviceCode(_ sender: NSButton)", "device-code login is not an explicit alternative action"),
     ("service.openDeviceAuthenticationPage(", "login UI does not open the official device page in Safari"),
     ("process.terminate()", "login flow cannot be cancelled"),
     ("authenticationStatus(for: entry)", "successful process exit is not verified with isolated login status"),
@@ -45,13 +46,36 @@ for expected, description in [
     if expected not in login_handler:
         failures.append(description)
 
-awaiting_code_start = login_handler.find("self.authenticationStates[entry.id] = .awaitingUserCode(prompt.code)")
-browser_open_call = login_handler.find("service.openDeviceAuthenticationPage(")
-if browser_open_call < 0 or awaiting_code_start < 0 or browser_open_call > awaiting_code_start:
+awaiting_code_start = login_handler.find("self.authenticationStates[entry.id] = .awaitingUserCode(")
+handoff_call = login_handler.find("handoff.handle(prompt: prompt")
+if handoff_call < 0 or awaiting_code_start < 0 or handoff_call > awaiting_code_start:
     failures.append("UI displays a device code before the official Safari page is opened")
 
-if '["login", "--device-auth"]' not in installer:
-    failures.append("non-TTY login does not select the CLI's supported device-code mode")
+if "copyCode: self?.writeDeviceCodeToClipboard" not in login_handler:
+    failures.append("device code is not copied to the clipboard during the active login handoff")
+if "pasteboard.setString(code, forType: .string)" not in source:
+    failures.append("device-code clipboard write is not wired to the system pasteboard")
+if "CLIDeviceCodeHandoff" not in login_handler or "clipboardCopied: result.clipboardCopied" not in login_handler:
+    failures.append("device-code handoff does not track a single clipboard-copy outcome")
+if "pasteboard.string(forType:" in source or "pasteboard.readObjects" in source:
+    failures.append("login flow reads clipboard contents")
+if 'case .browser: return "chatgpt"' not in installer or 'case .deviceCode: return "chatgptDeviceCode"' not in installer:
+    failures.append("browser OAuth is not the default account login mode with an explicit device-code alternative")
+if "loginCLI(sender, mode: .browser)" not in login_handler or '"account/login/completed"' not in login_handler or 'params["loginId"] as? String == activeLoginID' not in login_handler:
+    failures.append("primary browser login or same-attempt completion validation is missing")
+if "copyCode(prompt.code)" not in installer or "openPage(prompt.verificationURL)" not in installer:
+    failures.append("device-code handoff does not copy before opening the verification page")
+elif installer.find("copyCode(prompt.code)") > installer.find("openPage(prompt.verificationURL)"):
+    failures.append("device code is sent to Safari before the clipboard write")
+for expected in ["Falha ao copiar. Digite o código no Safari:",
+                 "Falha ao copiar e abrir a página. Digite o código manualmente:"]:
+    if expected not in installer:
+        failures.append("clipboard or browser failure does not preserve manual code recovery")
+
+if '["app-server", "--stdio"]' not in installer or 'method: "account/login/start"' not in installer:
+    failures.append("authentication does not use the official Codex app-server login contract")
+if "open.standardError = FileHandle.nullDevice" not in installer:
+    failures.append("authentication subprocess diagnostics could expose login flow output")
 if '"/Applications/Safari.app"' not in installer or '"https://auth.openai.com/codex/device"' not in installer:
     failures.append("Safari launch is not bound to the official device URL")
 if "session.output.fileHandleForReading" not in login_handler or "handle.availableData" not in login_handler:
@@ -62,4 +86,4 @@ if failures:
         print(f"FAIL: {failure}", file=sys.stderr)
     raise SystemExit(1)
 
-print("Manual install UI contract passed: per-registration install/login state and actionable Codex controls.")
+print("Manual install UI contract passed: per-registration install/login state, clipboard handoff, and actionable Codex controls.")

@@ -133,7 +133,8 @@ enum CLIAuthenticationUIState: Equatable {
     case checking
     case notAuthenticated
     case starting
-    case awaitingUserCode(String)
+    case awaitingBrowserAuthorization(pageOpened: Bool)
+    case awaitingUserCode(String, clipboardCopied: Bool, pageOpened: Bool)
     case authenticated
     case failed(String)
     case cancelled
@@ -143,7 +144,17 @@ enum CLIAuthenticationUIState: Equatable {
         case .checking: return "Verificando login isolado…"
         case .notAuthenticated: return "Login não configurado neste cadastro"
         case .starting: return "Iniciando login isolado…"
-        case .awaitingUserCode(let code): return "No Safari, confirme com o código: \(code)"
+        case .awaitingBrowserAuthorization(let opened):
+            return opened
+                ? "Safari aberto. Conclua o login e a autorização."
+                : "Safari não abriu. Cancele e escolha Código para tentar a alternativa."
+        case .awaitingUserCode(let code, let clipboardCopied, let pageOpened):
+            switch (clipboardCopied, pageOpened) {
+            case (true, true): return "Código copiado. No Safari, cole e confirme: \(code)"
+            case (false, true): return "Falha ao copiar. Digite o código no Safari: \(code)"
+            case (true, false): return "Código copiado. Abra a página oficial e cole: \(code)"
+            case (false, false): return "Falha ao copiar e abrir a página. Digite o código manualmente: \(code)"
+            }
         case .authenticated: return "Autenticado neste cadastro"
         case .failed(let message): return "Falha no login isolado · \(message)"
         case .cancelled: return "Login isolado cancelado"
@@ -179,11 +190,68 @@ enum CLIRegistrationInstallStatus: Equatable {
 }
 
 typealias CLICommandRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Int32
-typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ output: Pipe) throws -> Process
+typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ input: Pipe, _ output: Pipe) throws -> Process
+
+enum CLIAuthenticationMode: Equatable {
+    case browser
+    case deviceCode
+
+    var appServerLoginType: String {
+        switch self {
+        case .browser: return "chatgpt"
+        case .deviceCode: return "chatgptDeviceCode"
+        }
+    }
+}
 
 struct CLIAuthenticationSession {
     let process: Process
+    let input: Pipe
     let output: Pipe
+}
+
+enum CLIAppServerLoginProtocol {
+    static func message(id: Int, method: String, params: [String: Any]) -> Data? {
+        encode(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+    }
+
+    static func notification(method: String, params: [String: Any]? = nil) -> Data? {
+        var value: [String: Any] = ["jsonrpc": "2.0", "method": method]
+        if let params { value["params"] = params }
+        return encode(value)
+    }
+
+    static func startRequest(mode: CLIAuthenticationMode) -> Data? {
+        message(id: 2, method: "account/login/start", params: ["type": mode.appServerLoginType])
+    }
+
+    static func authURL(from response: [String: Any]) -> URL? {
+        guard let result = response["result"] as? [String: Any],
+              result["type"] as? String == CLIAuthenticationMode.browser.appServerLoginType,
+              let raw = result["authUrl"] as? String,
+              let url = URL(string: raw), url.scheme == "https", url.host == "auth.openai.com" else { return nil }
+        return url
+    }
+
+    static func loginID(from response: [String: Any]) -> String? {
+        (response["result"] as? [String: Any])?["loginId"] as? String
+    }
+
+    static func devicePrompt(from response: [String: Any]) -> CLIDeviceCodePrompt? {
+        guard let result = response["result"] as? [String: Any],
+              result["type"] as? String == CLIAuthenticationMode.deviceCode.appServerLoginType,
+              let rawURL = result["verificationUrl"] as? String,
+              let url = URL(string: rawURL), url.scheme == "https",
+              url.host == "auth.openai.com", url.path == "/codex/device",
+              let code = result["userCode"] as? String, !code.isEmpty else { return nil }
+        return CLIDeviceCodePrompt(verificationURL: url, code: code)
+    }
+
+    private static func encode(_ object: [String: Any]) -> Data? {
+        guard var data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        data.append(0x0A)
+        return data
+    }
 }
 
 struct CLIDeviceCodePrompt: Equatable {
@@ -191,13 +259,45 @@ struct CLIDeviceCodePrompt: Equatable {
     let code: String
 }
 
+struct CLIDeviceCodeHandoffResult: Equatable {
+    let clipboardCopied: Bool
+    let pageOpened: Bool
+}
+
+/// Claims one active CLI prompt and copies its code before handing the page to Safari.
+/// The app invokes this on the main queue so cancellation and UI handoff are serialized.
+final class CLIDeviceCodeHandoff {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var handledPrompt = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    func handle(prompt: CLIDeviceCodePrompt,
+                processIsRunning: Bool,
+                copyCode: (String) -> Bool,
+                openPage: (URL) -> Bool) -> CLIDeviceCodeHandoffResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled, !handledPrompt, processIsRunning else { return nil }
+        handledPrompt = true
+        let copied = copyCode(prompt.code)
+        let opened = openPage(prompt.verificationURL)
+        return CLIDeviceCodeHandoffResult(clipboardCopied: copied, pageOpened: opened)
+    }
+}
+
 private enum CLIProcessExecutor {
-    static func start(executable: URL, arguments: [String], environment: [String: String], output: Pipe) throws -> Process {
+    static func start(executable: URL, arguments: [String], environment: [String: String], input: Pipe, output: Pipe) throws -> Process {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
         process.environment = environment
-        process.standardInput = FileHandle.nullDevice
+        process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         try process.run()
@@ -463,9 +563,10 @@ struct CLIInstallService {
         return .authenticated
     }
 
-    /// Starts the official CLI's device-code login without a TTY. Captured output is parsed
-    /// in memory; only its fixed verification URL and one-time user code reach the UI.
-    func startAuthentication(for entry: CLIEntry) throws -> CLIAuthenticationSession {
+    /// Starts the official CLI app-server with this registration's isolated environment.
+    /// Browser and device-code login are distinct, explicit account/login/start requests.
+    func startAuthentication(for entry: CLIEntry,
+                             mode: CLIAuthenticationMode = .browser) throws -> CLIAuthenticationSession {
         guard registrationInstallStatus(for: entry) == .installed else {
             throw CLIInstallError.incompleteInstallation
         }
@@ -473,11 +574,27 @@ struct CLIInstallService {
         guard fileManager.fileExists(atPath: Self.safariExecutablePath) else {
             throw CLIInstallError.browserUnavailable
         }
+        let input = Pipe()
         let output = Pipe()
         let process = try authenticationProcessLauncher(managedExecutableURL(for: entry),
-                                                        ["login", "--device-auth"],
-                                                        isolatedRuntimeEnvironment(for: entry), output)
-        return CLIAuthenticationSession(process: process, output: output)
+                                                        ["app-server", "--stdio"],
+                                                        isolatedRuntimeEnvironment(for: entry), input, output)
+        if let initialize = CLIAppServerLoginProtocol.message(
+            id: 1, method: "initialize", params: [
+                "clientInfo": ["name": "PainelCli", "title": "PainelCli", "version": "0.0.0.27"],
+                "capabilities": ["experimentalApi": true]
+            ]) {
+            input.fileHandleForWriting.write(initialize)
+        }
+        return CLIAuthenticationSession(process: process, input: input, output: output)
+    }
+
+    func openBrowserAuthenticationPage(for entry: CLIEntry, authURL: URL) throws -> Bool {
+        guard authURL.scheme == "https", authURL.host == "auth.openai.com",
+              authURL.path == "/oauth/authorize", fileManager.fileExists(atPath: Self.safariExecutablePath) else {
+            throw CLIInstallError.browserUnavailable
+        }
+        return try openSafari(authURL)
     }
 
     func openDeviceAuthenticationPage(for entry: CLIEntry, verificationURL: URL) throws -> Bool {
@@ -487,9 +604,13 @@ struct CLIInstallService {
               fileManager.fileExists(atPath: Self.safariExecutablePath) else {
             throw CLIInstallError.browserUnavailable
         }
+        return try openSafari(verificationURL)
+    }
+
+    private func openSafari(_ url: URL) throws -> Bool {
         let open = Process()
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        open.arguments = ["-a", "/Applications/Safari.app", verificationURL.absoluteString]
+        open.arguments = ["-a", "/Applications/Safari.app", url.absoluteString]
         open.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
         open.standardInput = FileHandle.nullDevice
         open.standardOutput = FileHandle.nullDevice

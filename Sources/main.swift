@@ -86,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var installationFailures: [UUID: String] = [:]
     private var authenticationStates: [UUID: CLIAuthenticationUIState] = [:]
     private var authenticationProcesses: [UUID: Process] = [:]
+    private var authenticationHandoffs: [UUID: CLIDeviceCodeHandoff] = [:]
     private var checkingAuthenticationIDs = Set<UUID>()
     private var cancelledAuthenticationIDs = Set<UUID>()
     private var listItems: [CLIListItem] {
@@ -471,16 +472,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     account.toolTip = codexRegistration == nil
                         ? "Login disponível somente para um Codex instalado neste cadastro"
-                        : authState?.displayText ?? "Login disponível somente após a instalação isolada"
+                        : "Login normal pelo navegador; use Código para selecionar a alternativa de device-code"
                     account.setAccessibilityLabel(codexRegistration == nil
                         ? "Login indisponível para \(entry.displayName)"
-                        : "Entrar em \(entry.displayName)")
+                        : "Entrar pelo navegador em \(entry.displayName)")
                 }
                 account.setAccessibilityValue(authState?.displayText ?? "Login indisponível")
                 account.translatesAutoresizingMaskIntoConstraints = false
                 actions.addArrangedSubview(account)
                 account.widthAnchor.constraint(equalToConstant: 28).isActive = true
                 account.heightAnchor.constraint(equalToConstant: 28).isActive = true
+                if codexRegistration != nil {
+                    let deviceCode = NSButton(title: "Código", target: self,
+                                              action: #selector(loginCLIWithDeviceCode(_:)))
+                    deviceCode.bezelStyle = .rounded
+                    deviceCode.tag = index
+                    deviceCode.isEnabled = !storageLoadFailed && canStartLogin
+                    deviceCode.toolTip = "Usar explicitamente o login por código de dispositivo neste cadastro"
+                    deviceCode.setAccessibilityLabel("Entrar com código de dispositivo em \(entry.displayName)")
+                    actions.addArrangedSubview(deviceCode)
+                }
 
                 let remove = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
                                       target: self, action: #selector(removeCLI(_:)))
@@ -592,13 +603,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               authenticationProcesses[entry.id]?.isRunning != true else { return false }
         switch authenticationUIState(for: entry) {
         case .notAuthenticated, .failed, .cancelled: return true
-        case .checking, .starting, .awaitingUserCode, .authenticated: return false
+        case .checking, .starting, .awaitingBrowserAuthorization, .awaitingUserCode, .authenticated: return false
         }
     }
 
     private func isAuthenticationRunningState(_ state: CLIAuthenticationUIState) -> Bool {
         switch state {
-        case .starting, .awaitingUserCode: return true
+        case .starting, .awaitingBrowserAuthorization, .awaitingUserCode: return true
         case .checking, .notAuthenticated, .authenticated, .failed, .cancelled: return false
         }
     }
@@ -718,6 +729,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func loginCLI(_ sender: NSButton) {
+        loginCLI(sender, mode: .browser)
+    }
+
+    @objc private func loginCLIWithDeviceCode(_ sender: NSButton) {
+        loginCLI(sender, mode: .deviceCode)
+    }
+
+    private func loginCLI(_ sender: NSButton, mode: CLIAuthenticationMode) {
         guard !storageLoadFailed, let service = installService,
               listItems.indices.contains(sender.tag),
               let entry = listItems[sender.tag].manualEntry,
@@ -727,6 +746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isAuthenticationRunningState(authenticationStates[entry.id] ?? .notAuthenticated),
            let process = authenticationProcesses[entry.id], process.isRunning {
             cancelledAuthenticationIDs.insert(entry.id)
+            authenticationHandoffs[entry.id]?.cancel()
             authenticationStates[entry.id] = .cancelled
             process.terminate()
             render(.settings)
@@ -734,12 +754,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard canStartAuthentication(for: entry) else { return }
         cancelledAuthenticationIDs.remove(entry.id)
+        let handoff = CLIDeviceCodeHandoff()
+        authenticationHandoffs[entry.id] = handoff
         authenticationStates[entry.id] = .starting
         render(.settings)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let session = try service.startAuthentication(for: entry)
+                let session = try service.startAuthentication(for: entry, mode: mode)
                 let process = session.process
                 DispatchQueue.main.async {
                     guard let self else { process.terminate(); return }
@@ -747,8 +769,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.authenticationStates[entry.id] = .starting
                     if self.settingsButton.state == .on { self.render(.settings) }
                 }
-                let promptLock = NSLock()
-                var browserOpened = false
+                var loginRequestSent = false
+                var browserHandoffHandled = false
+                var deviceCodeReceived = false
+                var loginCompletedSuccessfully = false
+                var activeLoginID: String?
+                var appServerRequestFailed = false
                 let readerFinished = DispatchGroup()
                 readerFinished.enter()
                 DispatchQueue.global(qos: .utility).async {
@@ -759,46 +785,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         let chunk = handle.availableData
                         guard !chunk.isEmpty else { break }
                         buffered.append(chunk)
-                        if buffered.count > 8192 { buffered = Data(buffered.suffix(8192)) }
-                        guard let text = String(data: buffered, encoding: .utf8),
-                              let prompt = CLIInstallService.deviceCodePrompt(in: text) else { continue }
-                        promptLock.lock()
-                        let alreadyOpened = browserOpened
-                        promptLock.unlock()
-                        guard !alreadyOpened else { continue }
-                        let opened = (try? service.openDeviceAuthenticationPage(
-                            for: entry, verificationURL: prompt.verificationURL)) == true
-                        promptLock.lock()
-                        browserOpened = opened
-                        promptLock.unlock()
-                        DispatchQueue.main.async {
-                            guard let self,
-                                  self.cancelledAuthenticationIDs.contains(entry.id) == false else { return }
-                            if opened {
-                                self.authenticationStates[entry.id] = .awaitingUserCode(prompt.code)
-                            } else {
-                                self.authenticationStates[entry.id] = .failed("O Safari não aceitou a página oficial; o login foi interrompido.")
+                        while let newline = buffered.firstIndex(of: 0x0A) {
+                            let line = Data(buffered[..<newline])
+                            buffered.removeSubrange(...newline)
+                            guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+                            else { continue }
+                            let responseID = message["id"] as? Int
+                            if responseID == 1, !loginRequestSent {
+                                if message["error"] != nil {
+                                    appServerRequestFailed = true
+                                    if process.isRunning { process.terminate() }
+                                } else {
+                                    session.input.fileHandleForWriting.write(
+                                        CLIAppServerLoginProtocol.notification(method: "initialized") ?? Data())
+                                    session.input.fileHandleForWriting.write(
+                                        CLIAppServerLoginProtocol.startRequest(mode: mode) ?? Data())
+                                    loginRequestSent = true
+                                }
+                            } else if responseID == 2, mode == .browser,
+                                      !browserHandoffHandled,
+                                      let authURL = CLIAppServerLoginProtocol.authURL(from: message) {
+                                browserHandoffHandled = true
+                                activeLoginID = CLIAppServerLoginProtocol.loginID(from: message)
+                                DispatchQueue.main.sync {
+                                    guard process.isRunning,
+                                          self?.cancelledAuthenticationIDs.contains(entry.id) == false else { return }
+                                    let opened = (try? service.openBrowserAuthenticationPage(for: entry,
+                                                                                           authURL: authURL)) == true
+                                    guard let self else { return }
+                                    self.authenticationStates[entry.id] = .awaitingBrowserAuthorization(pageOpened: opened)
+                                    if self.settingsButton.state == .on { self.render(.settings) }
+                                }
+                            } else if responseID == 2, mode == .deviceCode,
+                                      let prompt = CLIAppServerLoginProtocol.devicePrompt(from: message) {
+                                activeLoginID = CLIAppServerLoginProtocol.loginID(from: message)
+                                var result: CLIDeviceCodeHandoffResult?
+                                DispatchQueue.main.sync {
+                                    result = handoff.handle(prompt: prompt,
+                                                            processIsRunning: process.isRunning,
+                                                            copyCode: self?.writeDeviceCodeToClipboard ?? { _ in false },
+                                                            openPage: { url in
+                                                                (try? service.openDeviceAuthenticationPage(
+                                                                    for: entry, verificationURL: url)) == true
+                                                            })
+                                    guard let self, let result else { return }
+                                    deviceCodeReceived = true
+                                    self.authenticationStates[entry.id] = .awaitingUserCode(
+                                        prompt.code,
+                                        clipboardCopied: result.clipboardCopied,
+                                        pageOpened: result.pageOpened)
+                                    if self.settingsButton.state == .on { self.render(.settings) }
+                                }
+                            } else if (responseID == 1 || responseID == 2), message["error"] != nil {
+                                appServerRequestFailed = true
+                                if process.isRunning { process.terminate() }
+                            } else if responseID == 2 {
+                                appServerRequestFailed = true
+                                if process.isRunning { process.terminate() }
+                            } else if message["method"] as? String == "account/login/completed",
+                                      let params = message["params"] as? [String: Any],
+                                      params["loginId"] as? String == activeLoginID,
+                                      params["success"] as? Bool == true {
+                                loginCompletedSuccessfully = true
                                 if process.isRunning { process.terminate() }
                             }
-                            if self.settingsButton.state == .on { self.render(.settings) }
                         }
                     }
                 }
                 process.waitUntilExit()
                 readerFinished.wait()
-                promptLock.lock()
-                let confirmedBrowser = browserOpened
-                promptLock.unlock()
                 let authenticated = (try? service.authenticationStatus(for: entry)) == .authenticated
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.authenticationProcesses.removeValue(forKey: entry.id)
+                    self.authenticationHandoffs.removeValue(forKey: entry.id)
                     if authenticated {
                         self.authenticationStates[entry.id] = .authenticated
                     } else if self.cancelledAuthenticationIDs.remove(entry.id) != nil {
                         self.authenticationStates[entry.id] = .cancelled
-                    } else if !confirmedBrowser {
-                        self.authenticationStates[entry.id] = .failed("A CLI não disponibilizou um código de acesso para abrir no Safari.")
+                    } else if mode == .browser && !browserHandoffHandled {
+                        self.authenticationStates[entry.id] = .failed("A CLI não iniciou o login normal pelo navegador. Tente novamente ou escolha Código explicitamente.")
+                    } else if mode == .deviceCode && !deviceCodeReceived {
+                        self.authenticationStates[entry.id] = .failed("A CLI não disponibilizou o código de dispositivo. O login normal pelo navegador continua disponível.")
+                    } else if !loginCompletedSuccessfully {
+                        self.authenticationStates[entry.id] = .failed(appServerRequestFailed
+                            ? "A CLI não aceitou o pedido de autenticação. Tente novamente ou escolha Código."
+                            : "A autorização não foi confirmada pela CLI.")
                     } else if process.terminationStatus == 0 {
                         self.authenticationStates[entry.id] = .failed("A CLI encerrou sem confirmar a autenticação.")
                     } else {
@@ -820,6 +892,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    private func writeDeviceCodeToClipboard(_ code: String) -> Bool {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.setString(code, forType: .string)
     }
 
     private func showStoreFailure(_ message: String) {

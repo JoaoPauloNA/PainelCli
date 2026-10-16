@@ -230,7 +230,7 @@ let syntheticAuthService = CLIInstallService(
         authenticationStatusCommand = (executable, arguments, environment)
         return 1
     },
-    authenticationProcessLauncher: { executable, arguments, environment, _ in
+    authenticationProcessLauncher: { executable, arguments, environment, _, _ in
         authenticationCommand = (executable, arguments, environment)
         return Process()
     })
@@ -239,16 +239,44 @@ require(syntheticAuthenticationStatus == .notAuthenticated,
         "isolated login status maps the synthetic nonzero command result to not authenticated")
 let fakeAuthProcess = try syntheticAuthService.startAuthentication(for: originalRegistration)
 require(authenticationStatusCommand?.1 == ["login", "status"] &&
-        authenticationCommand?.1 == ["login", "--device-auth"] &&
+        authenticationCommand?.1 == ["app-server", "--stdio"] &&
         authenticationCommand?.0 == originalInstallExecutable,
-        "status and device-code login target only the Codex 0 executable with fixed arguments")
+        "status and app-server login target only the Codex 0 executable with fixed arguments")
 require(authenticationStatusCommand?.2["CODEX_HOME"] == originalInstallDirectory
             .appendingPathComponent("installation/codex-home").path &&
         authenticationCommand?.2["HOME"] == originalInstallDirectory
             .appendingPathComponent("installation/home").path &&
         authenticationCommand?.2["OPENAI_API_KEY"] == nil &&
         authenticationCommand?.2["NPM_TOKEN"] == nil,
-        "login and status inherit the instance runtime environment without host credentials")
+        "browser login and status inherit the instance runtime environment without host credentials")
+let browserLoginRequest = CLIAppServerLoginProtocol.startRequest(mode: .browser)
+let deviceLoginRequest = CLIAppServerLoginProtocol.startRequest(mode: .deviceCode)
+let browserLoginObject = try JSONSerialization.jsonObject(with: browserLoginRequest!.dropLast()) as! [String: Any]
+let deviceLoginObject = try JSONSerialization.jsonObject(with: deviceLoginRequest!.dropLast()) as! [String: Any]
+require(((browserLoginObject["params"] as? [String: String])?["type"] == "chatgpt") &&
+        ((deviceLoginObject["params"] as? [String: String])?["type"] == "chatgptDeviceCode"),
+        "normal browser OAuth is the default request and device-code requires an explicit mode")
+let initializeRequest = CLIAppServerLoginProtocol.message(
+    id: 1, method: "initialize", params: ["capabilities": ["experimentalApi": true]])!
+let initializeObject = try JSONSerialization.jsonObject(with: initializeRequest.dropLast()) as! [String: Any]
+require(((initializeObject["params"] as? [String: Any])?["capabilities"] as? [String: Bool])?["experimentalApi"] == true,
+        "the official app-server protocol explicitly negotiates its login contract")
+let authResponse = ["result": ["type": "chatgpt",
+                               "loginId": "synthetic-login",
+                               "authUrl": "https://auth.openai.com/oauth/authorize?state=synthetic"]]
+require(CLIAppServerLoginProtocol.authURL(from: authResponse)?.host == "auth.openai.com" &&
+        CLIAppServerLoginProtocol.loginID(from: authResponse) == "synthetic-login" &&
+        CLIAppServerLoginProtocol.authURL(from: ["result": ["type": "chatgpt",
+                                                            "authUrl": "https://example.invalid/oauth/authorize"]]) == nil,
+        "browser authorization accepts only the official HTTPS authentication host")
+require(!CLIAuthenticationUIState.awaitingBrowserAuthorization(pageOpened: true)
+            .displayText.contains("auth.openai.com"),
+        "browser auth URLs are never shown in the app's visible status text")
+let deviceResponse = ["result": ["type": "chatgptDeviceCode",
+                                 "verificationUrl": "https://auth.openai.com/codex/device",
+                                 "userCode": "ABCD-EFGH"]]
+require(CLIAppServerLoginProtocol.devicePrompt(from: deviceResponse)?.code == "ABCD-EFGH",
+        "explicit device-code mode parses the typed app-server response in memory")
 let devicePrompt = """
 Welcome to Codex
 1. Open this link in your browser and sign in to your account
@@ -261,6 +289,51 @@ require(CLIInstallService.deviceCodePrompt(in: devicePrompt) == CLIDeviceCodePro
         "official device-code output is parsed in memory into the fixed URL and user code")
 require(CLIInstallService.deviceCodePrompt(in: "https://auth.openai.com/other\nEnter this one-time code\nABCD-EFGH") == nil,
         "unapproved device URLs are never accepted from CLI output")
+let clipboardPrompt = CLIDeviceCodePrompt(
+    verificationURL: URL(string: "https://auth.openai.com/codex/device")!, code: "ABCD-EFGH")
+let handoff = CLIDeviceCodeHandoff()
+var handoffEvents: [String] = []
+let handoffResult = handoff.handle(prompt: clipboardPrompt, processIsRunning: true,
+                                   copyCode: { code in
+                                       require(code == "ABCD-EFGH", "clipboard receives only the active synthetic device code")
+                                       handoffEvents.append("copy")
+                                       return true
+                                   },
+                                   openPage: { url in
+                                       require(url == clipboardPrompt.verificationURL,
+                                               "browser handoff uses the fixed official verification page")
+                                       handoffEvents.append("open")
+                                       return true
+                                   })
+require(handoffResult == CLIDeviceCodeHandoffResult(clipboardCopied: true, pageOpened: true) &&
+        handoffEvents == ["copy", "open"],
+        "active device code is copied once before opening Safari")
+let repeatedHandoff = handoff.handle(prompt: clipboardPrompt, processIsRunning: true,
+                                     copyCode: { _ in handoffEvents.append("duplicate-copy"); return true },
+                                     openPage: { _ in handoffEvents.append("duplicate-open"); return true })
+require(repeatedHandoff == nil && handoffEvents == ["copy", "open"],
+        "repeated output cannot copy or open the same device prompt twice")
+let cancelledHandoff = CLIDeviceCodeHandoff()
+cancelledHandoff.cancel()
+require(cancelledHandoff.handle(prompt: clipboardPrompt, processIsRunning: true,
+                                copyCode: { _ in false }, openPage: { _ in false }) == nil,
+        "cancelled login attempts never copy or open a later prompt")
+require(CLIDeviceCodeHandoff().handle(prompt: clipboardPrompt, processIsRunning: false,
+                                      copyCode: { _ in false }, openPage: { _ in false }) == nil,
+        "a prompt from an exited process is ignored")
+let failedClipboardState = CLIAuthenticationUIState.awaitingUserCode(
+    "ABCD-EFGH", clipboardCopied: false, pageOpened: true)
+require(failedClipboardState.displayText.contains("Falha ao copiar") &&
+        failedClipboardState.displayText.contains("Digite o código no Safari"),
+        "clipboard failure is explicit and retains manual recovery instructions")
+var recoveryPageOpened = false
+let failedClipboardResult = CLIDeviceCodeHandoff().handle(
+    prompt: clipboardPrompt, processIsRunning: true,
+    copyCode: { _ in false },
+    openPage: { _ in recoveryPageOpened = true; return true })
+require(failedClipboardResult == CLIDeviceCodeHandoffResult(clipboardCopied: false, pageOpened: true) &&
+        recoveryPageOpened,
+        "a clipboard failure does not block the official page or manual code recovery")
 _ = fakeAuthProcess
 require(CLIInstallService.authenticationPolicyAllowsFile(
             documents: ["cli_auth_credentials_store = \"file\"\nallowed_login_methods = [\"chatgpt\"]"],
