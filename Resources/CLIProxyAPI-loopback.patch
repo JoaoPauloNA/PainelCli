@@ -1,0 +1,360 @@
+diff --git a/internal/api/handlers/management/auth_files_oauth_callback.go b/internal/api/handlers/management/auth_files_oauth_callback.go
+index f33f82e..2210cdb 100644
+--- a/internal/api/handlers/management/auth_files_oauth_callback.go
++++ b/internal/api/handlers/management/auth_files_oauth_callback.go
+@@ -7,10 +7,13 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/loopback"
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+@@ -50,10 +53,9 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
+ 		stopForwarderInstance(port, prev)
+ 	}
+ 
+-	addr := fmt.Sprintf("0.0.0.0:%d", port)
+-	ln, err := net.Listen("tcp", addr)
++	listeners, err := loopback.Listen(port)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
++		return nil, fmt.Errorf("failed to listen on localhost:%d: %w", port, err)
+ 	}
+ 
+ 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+@@ -75,13 +77,17 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
+ 		WriteTimeout:      5 * time.Second,
+ 	}
+ 	done := make(chan struct{})
+-
+-	go func() {
+-		if errServe := srv.Serve(ln); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
+-			log.WithError(errServe).Warnf("callback forwarder for %s stopped unexpectedly", provider)
+-		}
+-		close(done)
+-	}()
++	var serveGroup sync.WaitGroup
++	for _, listener := range listeners {
++		serveGroup.Add(1)
++		go func(listener net.Listener) {
++			defer serveGroup.Done()
++			if errServe := srv.Serve(listener); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
++				log.WithError(errServe).Warnf("callback forwarder for %s stopped unexpectedly", provider)
++			}
++		}(listener)
++	}
++	go func() { serveGroup.Wait(); close(done) }()
+ 
+ 	forwarder := &callbackForwarder{
+ 		provider: provider,
+@@ -93,7 +99,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
+ 	callbackForwarders[port] = forwarder
+ 	callbackForwardersMu.Unlock()
+ 
+-	log.Infof("callback forwarder for %s listening on %s", provider, addr)
++	log.Infof("callback forwarder for %s listening on localhost:%s", provider, strconv.Itoa(port))
+ 
+ 	return forwarder, nil
+ }
+diff --git a/internal/auth/claude/oauth_server.go b/internal/auth/claude/oauth_server.go
+index a6ebe2f..b70e83b 100644
+--- a/internal/auth/claude/oauth_server.go
++++ b/internal/auth/claude/oauth_server.go
+@@ -13,6 +13,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/loopback"
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+@@ -21,7 +22,8 @@ import (
+ // and captures the necessary parameters to complete the authentication flow.
+ type OAuthServer struct {
+ 	// server is the underlying HTTP server instance
+-	server *http.Server
++	server    *http.Server
++	listeners []net.Listener
+ 	// port is the port number on which the server listens
+ 	port int
+ 	// resultChan is a channel for sending OAuth results
+@@ -77,17 +79,16 @@ func (s *OAuthServer) Start() error {
+ 		return fmt.Errorf("server is already running")
+ 	}
+ 
+-	// Check if port is available
+-	if !s.isPortAvailable() {
+-		return fmt.Errorf("port %d is already in use", s.port)
+-	}
+-
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/callback", s.handleCallback)
+ 	mux.HandleFunc("/success", s.handleSuccess)
+ 
++	listeners, err := loopback.Listen(s.port)
++	if err != nil {
++		return fmt.Errorf("callback listener must bind to localhost: %w", err)
++	}
++	s.listeners = listeners
+ 	s.server = &http.Server{
+-		Addr:         fmt.Sprintf(":%d", s.port),
+ 		Handler:      mux,
+ 		ReadTimeout:  10 * time.Second,
+ 		WriteTimeout: 10 * time.Second,
+@@ -95,12 +96,15 @@ func (s *OAuthServer) Start() error {
+ 
+ 	s.running = true
+ 
+-	// Start server in goroutine
+-	go func() {
+-		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+-			s.errorChan <- fmt.Errorf("server failed to start: %w", err)
+-		}
+-	}()
++	// Serve every localhost address so the registered http://localhost redirect
++	// works with either IPv4 or IPv6 resolution without listening on LAN interfaces.
++	for _, listener := range listeners {
++		go func(listener net.Listener) {
++			if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
++				s.errorChan <- fmt.Errorf("server failed to start: %w", err)
++			}
++		}(listener)
++	}
+ 
+ 	// Give server a moment to start
+ 	time.Sleep(100 * time.Millisecond)
+@@ -133,6 +137,7 @@ func (s *OAuthServer) Stop(ctx context.Context) error {
+ 	err := s.server.Shutdown(shutdownCtx)
+ 	s.running = false
+ 	s.server = nil
++	s.listeners = nil
+ 
+ 	return err
+ }
+@@ -298,14 +303,13 @@ func (s *OAuthServer) sendResult(result *OAuthResult) {
+ // Returns:
+ //   - bool: True if the port is available, false otherwise
+ func (s *OAuthServer) isPortAvailable() bool {
+-	addr := fmt.Sprintf(":%d", s.port)
+-	listener, err := net.Listen("tcp", addr)
++	listeners, err := loopback.Listen(s.port)
+ 	if err != nil {
+ 		return false
+ 	}
+-	defer func() {
++	for _, listener := range listeners {
+ 		_ = listener.Close()
+-	}()
++	}
+ 	return true
+ }
+ 
+diff --git a/internal/auth/codex/oauth_server.go b/internal/auth/codex/oauth_server.go
+index 9c6a6c5..3f29336 100644
+--- a/internal/auth/codex/oauth_server.go
++++ b/internal/auth/codex/oauth_server.go
+@@ -10,6 +10,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/router-for-me/CLIProxyAPI/v8/internal/loopback"
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+@@ -18,7 +19,8 @@ import (
+ // and captures the necessary parameters to complete the authentication flow.
+ type OAuthServer struct {
+ 	// server is the underlying HTTP server instance
+-	server *http.Server
++	server    *http.Server
++	listeners []net.Listener
+ 	// port is the port number on which the server listens
+ 	port int
+ 	// resultChan is a channel for sending OAuth results
+@@ -74,17 +76,16 @@ func (s *OAuthServer) Start() error {
+ 		return fmt.Errorf("server is already running")
+ 	}
+ 
+-	// Check if port is available
+-	if !s.isPortAvailable() {
+-		return fmt.Errorf("port %d is already in use", s.port)
+-	}
+-
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("/auth/callback", s.handleCallback)
+ 	mux.HandleFunc("/success", s.handleSuccess)
+ 
++	listeners, err := loopback.Listen(s.port)
++	if err != nil {
++		return fmt.Errorf("callback listener must bind to localhost: %w", err)
++	}
++	s.listeners = listeners
+ 	s.server = &http.Server{
+-		Addr:         fmt.Sprintf(":%d", s.port),
+ 		Handler:      mux,
+ 		ReadTimeout:  10 * time.Second,
+ 		WriteTimeout: 10 * time.Second,
+@@ -92,12 +93,15 @@ func (s *OAuthServer) Start() error {
+ 
+ 	s.running = true
+ 
+-	// Start server in goroutine
+-	go func() {
+-		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+-			s.errorChan <- fmt.Errorf("server failed to start: %w", err)
+-		}
+-	}()
++	// Serve every localhost address so the registered http://localhost redirect
++	// works with either IPv4 or IPv6 resolution without listening on LAN interfaces.
++	for _, listener := range listeners {
++		go func(listener net.Listener) {
++			if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
++				s.errorChan <- fmt.Errorf("server failed to start: %w", err)
++			}
++		}(listener)
++	}
+ 
+ 	// Give server a moment to start
+ 	time.Sleep(100 * time.Millisecond)
+@@ -130,6 +134,7 @@ func (s *OAuthServer) Stop(ctx context.Context) error {
+ 	err := s.server.Shutdown(shutdownCtx)
+ 	s.running = false
+ 	s.server = nil
++	s.listeners = nil
+ 
+ 	return err
+ }
+@@ -295,14 +300,13 @@ func (s *OAuthServer) sendResult(result *OAuthResult) {
+ // Returns:
+ //   - bool: True if the port is available, false otherwise
+ func (s *OAuthServer) isPortAvailable() bool {
+-	addr := fmt.Sprintf(":%d", s.port)
+-	listener, err := net.Listen("tcp", addr)
++	listeners, err := loopback.Listen(s.port)
+ 	if err != nil {
+ 		return false
+ 	}
+-	defer func() {
++	for _, listener := range listeners {
+ 		_ = listener.Close()
+-	}()
++	}
+ 	return true
+ }
+ 
+diff --git a/internal/loopback/listen.go b/internal/loopback/listen.go
+new file mode 100644
+index 0000000..76570a2
+--- /dev/null
++++ b/internal/loopback/listen.go
+@@ -0,0 +1,52 @@
++// Package loopback binds only addresses resolved for localhost and rejects any
++// non-loopback result before opening a socket.
++package loopback
++
++import (
++	"fmt"
++	"net"
++	"strconv"
++)
++
++// Listen opens a listener for each loopback address returned for localhost.
++// A port of zero selects one available port and binds every address to it.
++func Listen(port int) ([]net.Listener, error) {
++	addresses, err := net.LookupIP("localhost")
++	if err != nil {
++		return nil, fmt.Errorf("resolve localhost: %w", err)
++	}
++	if len(addresses) == 0 {
++		return nil, fmt.Errorf("localhost has no resolved addresses")
++	}
++	for _, address := range addresses {
++		if !address.IsLoopback() {
++			return nil, fmt.Errorf("localhost resolved to non-loopback address %s", address)
++		}
++	}
++	var listeners []net.Listener
++	selectedPort := port
++	for _, address := range addresses {
++		listener, listenErr := net.Listen("tcp", net.JoinHostPort(address.String(), strconv.Itoa(selectedPort)))
++		if listenErr != nil {
++			closeAll(listeners)
++			return nil, fmt.Errorf("listen on loopback %s:%d: %w", address, selectedPort, listenErr)
++		}
++		tcpAddress, ok := listener.Addr().(*net.TCPAddr)
++		if !ok || !tcpAddress.IP.IsLoopback() {
++			_ = listener.Close()
++			closeAll(listeners)
++			return nil, fmt.Errorf("listener address is not loopback")
++		}
++		if selectedPort == 0 {
++			selectedPort = tcpAddress.Port
++		}
++		listeners = append(listeners, listener)
++	}
++	return listeners, nil
++}
++
++func closeAll(listeners []net.Listener) {
++	for _, listener := range listeners {
++		_ = listener.Close()
++	}
++}
+diff --git a/internal/loopback/listen_test.go b/internal/loopback/listen_test.go
+new file mode 100644
+index 0000000..047b0b6
+--- /dev/null
++++ b/internal/loopback/listen_test.go
+@@ -0,0 +1,45 @@
++package loopback
++
++import (
++	"net"
++	"testing"
++)
++
++func TestListenBindsOnlyLocalhostAndSupportsTheRegisteredCallbackHost(t *testing.T) {
++	listeners, err := Listen(0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer closeAll(listeners)
++	if len(listeners) == 0 {
++		t.Fatal("Listen returned no localhost listeners")
++	}
++	port := listeners[0].Addr().(*net.TCPAddr).Port
++	for _, listener := range listeners {
++		address, ok := listener.Addr().(*net.TCPAddr)
++		if !ok || !address.IP.IsLoopback() {
++			t.Fatalf("listener address %v is not loopback", listener.Addr())
++		}
++		if address.Port != port {
++			t.Fatalf("localhost listeners use different ports: %d and %d", port, address.Port)
++		}
++		connection, errDial := net.Dial("tcp", address.String())
++		if errDial != nil {
++			t.Fatalf("cannot reach callback listener at %s: %v", address, errDial)
++		}
++		_ = connection.Close()
++	}
++}
++
++func TestListenFailsClosedWhenACallbackPortIsOccupied(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	port := listener.Addr().(*net.TCPAddr).Port
++	if opened, errListen := Listen(port); errListen == nil {
++		closeAll(opened)
++		t.Fatalf("Listen(%d) succeeded while the port was occupied", port)
++	}
++}

@@ -8,6 +8,7 @@ trap 'rm -rf "$temp_dir"' EXIT
 xcrun swiftc \
   "$repo_root/Sources/CLIEntryStore.swift" \
   "$repo_root/Sources/CLIInstaller.swift" \
+  "$repo_root/Sources/CLIProxy.swift" \
   "$repo_root/Sources/main.swift" \
   -framework AppKit \
   -o "$temp_dir/PainelCli"
@@ -15,6 +16,7 @@ xcrun swiftc \
 xcrun swiftc \
   "$repo_root/Sources/CLIEntryStore.swift" \
   "$repo_root/Sources/CLIInstaller.swift" \
+  "$repo_root/Sources/CLIProxy.swift" \
   "$repo_root/Tests/main.swift" \
   -o "$temp_dir/PainelCliTests"
 

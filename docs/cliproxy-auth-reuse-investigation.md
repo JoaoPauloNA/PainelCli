@@ -1,0 +1,25 @@
+# CLIProxyAPI: reaproveitamento da autenticação existente
+
+**Escopo:** investigação somente leitura; nenhuma credencial local/Keychain foi lida, copiada ou usada. Nenhum login, proxy, pedido de inferência, build ou alteração de versão foi executado. O projeto já estava na versão `0.0.34`; não foi alterado código do app.
+
+## Conclusão
+
+Não há um caminho demonstrado e oficialmente documentado para conectar o CLIProxyAPI aos logins já existentes das instalações UUID do CodexCLI ou ClaudeCLI sem expor/reformatar credenciais. A documentação do CLIProxyAPI descreve seus próprios endpoints de login OAuth e gravação de tokens em `auth-dir`/`auths/`. O caminho mais conservador, se a ativação vier a ser autorizada, é o CLIProxyAPI concluir seu próprio OAuth e manter os arquivos de autenticação numa pasta própria, isolada por UUID. Isso é um segundo login OAuth, ainda que o usuário escolha a mesma conta; não é reaproveitamento transparente da sessão atual.
+
+| CLI | Evidência de formato/armazenamento | Resultado para reaproveitamento direto |
+|---|---|---|
+| CodexCLI | A documentação oficial do Codex diz que `auth.json` tem credenciais sensíveis e pode ser substituído pelo credential store do sistema. No código Codex inspecionado, o arquivo tem campos de nível externo `auth_mode` e `tokens`; no CLIProxyAPI v8.0.16, o leitor identifica `type` no nível externo e as credenciais OAuth próprias têm campos achatados como `access_token`, `refresh_token` e `id_token`. | **Não é plug-and-play.** Com armazenamento em keyring nem há um `auth.json` garantido. No modo arquivo, o formato não corresponde ao leitor de auth files do proxy: importar exigiria extrair/remapear tokens. A documentação OpenAI explica cópia entre clientes Codex confiáveis, não integração de terceiros com CLIProxyAPI; portanto não encontrei suporte oficial para esse reaproveitamento. |
+| ClaudeCLI | A documentação Anthropic diz que, no macOS, tokens OAuth e outras credenciais ficam no Keychain criptografado. O CLIProxyAPI v8.0.16 mantém seu próprio fluxo OAuth, schema de auth e atualização de tokens, sob `auth-dir`. | **Não é reaproveitável diretamente com o Keychain.** Não encontrei interface oficial Anthropic para entregar a sessão existente a esse proxy. Importar um eventual arquivo de sessão exigiria uma integração específica e não documentada. |
+
+O ciclo de refresh também importa: CLIProxyAPI atualiza e persiste os próprios registros OAuth. O código de Claude documenta cautela com replay de refresh token após resposta ambígua. Compartilhar o mesmo refresh token entre o CLI e o proxy poderia causar concorrência, rotação ou perda de sessão; isso não foi testado com contas reais.
+
+## Fontes primárias consultadas
+
+- [OpenAI — Authentication and credential storage](https://learn.chatgpt.com/docs/auth): armazenamento `file | keyring | auto | ephemeral`, localização de `CODEX_HOME/auth.json`, sensibilidade dos tokens e escopo do método de cópia descrito para Codex em máquina headless.
+- [Anthropic — Identity and access management / Credential management](https://docs.anthropic.com/en/docs/claude-code/iam): métodos de autenticação do Claude Code e armazenamento de credenciais no Keychain do macOS.
+- [OpenAI Codex CLI v0.143.0, `storage.rs` no snapshot inspecionado](https://github.com/openai/codex/blob/c4d748f586a84a3ed5b6aceb82e9a1db4abb1cda/codex-rs/login/src/auth/storage.rs) e [`token_data.rs`](https://github.com/openai/codex/blob/c4d748f586a84a3ed5b6aceb82e9a1db4abb1cda/codex-rs/login/src/token_data.rs): estrutura externa do `auth.json` e dados de token aninhados.
+- [CLIProxyAPI v8.0.16, `internal/watcher/synthesizer/file.go`](https://github.com/router-for-me/CLIProxyAPI/blob/a2976eb8a303f11b4ea5177bce9f9ff752634dfc/internal/watcher/synthesizer/file.go) e [`internal/auth/codex/token.go`](https://github.com/router-for-me/CLIProxyAPI/blob/a2976eb8a303f11b4ea5177bce9f9ff752634dfc/internal/auth/codex/token.go): reconhecimento pelo `type` de nível externo e schema de credencial achatado do proxy.
+- [CLIProxyAPI v8.0.16, fluxo OAuth/refresh do Codex](https://github.com/router-for-me/CLIProxyAPI/blob/a2976eb8a303f11b4ea5177bce9f9ff752634dfc/internal/auth/codex/openai_auth.go), [OAuth/refresh do Claude](https://github.com/router-for-me/CLIProxyAPI/blob/a2976eb8a303f11b4ea5177bce9f9ff752634dfc/internal/auth/claude/anthropic_auth.go) e [exemplo de configuração `auth-dir`](https://github.com/router-for-me/CLIProxyAPI/blob/a2976eb8a303f11b4ea5177bce9f9ff752634dfc/config.example.yaml).
+- [CLIProxyAPI — Management API: OAuth URLs e Auth File Management](https://github.com/router-for-me/CLIProxyAPIDocs/blob/main/docs/en/management/api.md): endpoints para iniciar login Anthropic/Codex e persistência dos tokens pelo próprio serviço em `auth-dir`.
+
+**Decisão preservada:** esta análise não escolhe o modo OAuth, não ativa nem integra o proxy. Se a intenção for seguir pelo caminho com menor risco de interferir nos CLIs UUID, a escolha pendente é autorizar ou não um login OAuth independente do CLIProxyAPI com diretório de auth próprio por UUID. Até essa decisão, manter somente a exibição de prontidão não conectada continua coerente.

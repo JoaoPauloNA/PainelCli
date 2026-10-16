@@ -136,44 +136,78 @@ require(CLIDiscoveryTarget.gemini.executableName == "gemini" &&
         CLIDiscoveryTarget.antigravity.executableName == "agy",
         "Gemini remains an independent detection target")
 
-let proxyCodexA = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
-let proxyCodexB = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 1)
-let proxyClaude = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 0)
-let proxySignedOut = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 2)
-let proxyUnknown = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 1)
-let proxyMissingStatus = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 3)
-let proxyFailed = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 3)
-let proxyUninstalled = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 2)
-let proxyAntigravity = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
-let proxySystemCodex = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0,
-                                origin: .automatic, detectedPath: "/usr/local/bin/codex")
-let proxyCandidates = [proxyCodexA, proxyCodexB, proxyClaude, proxySignedOut,
-                       proxyUnknown, proxyMissingStatus, proxyFailed, proxyUninstalled,
-                       proxyAntigravity, proxySystemCodex]
-let proxyInstalledIDs: Set<UUID> = [proxyCodexA.id, proxyCodexB.id, proxyClaude.id,
-                                     proxySignedOut.id, proxyUnknown.id, proxyMissingStatus.id,
-                                     proxyFailed.id, proxyAntigravity.id, proxySystemCodex.id]
-var proxyAuthenticationStates: [UUID: CLIAuthenticationUIState] = [
-    proxyCodexA.id: .authenticated,
-    proxyCodexB.id: .authenticated,
-    proxyClaude.id: .authenticated,
-    proxySignedOut.id: .notAuthenticated,
-    proxyUnknown.id: .statusError("synthetic status unavailable"),
-    proxyFailed.id: .failed("synthetic failure"),
-    proxyAntigravity.id: .authenticated,
-    proxySystemCodex.id: .authenticated
-]
-let initialProxyReady = CLIProxyReadiness.readyEntries(proxyCandidates,
-                                                       installedIDs: proxyInstalledIDs,
-                                                       authenticationStates: proxyAuthenticationStates)
-require(initialProxyReady.map(\.id) == [proxyCodexA.id, proxyCodexB.id, proxyClaude.id],
-        "CLIProxy includes each authenticated managed UUID and excludes system, Antigravity, unknown, signed-out, and uninstalled entries")
-proxyAuthenticationStates[proxyCodexA.id] = .notAuthenticated
-let refreshedProxyReady = CLIProxyReadiness.readyEntries(proxyCandidates,
-                                                         installedIDs: proxyInstalledIDs,
-                                                         authenticationStates: proxyAuthenticationStates)
-require(refreshedProxyReady.map(\.id) == [proxyCodexB.id, proxyClaude.id],
-        "a fresh signed-out status removes that UUID without collapsing sibling registrations")
+// CLIProxy registrations use their own store and UUID namespace, independent of native CLIs.
+let proxyStore = CLIProxyProfileStore(applicationSupportDirectory: testRoot)
+let proxyCodex0 = try proxyStore.add(provider: .codex).last!
+let proxyCodex1 = try proxyStore.add(provider: .codex).last!
+let proxyClaude0 = try proxyStore.add(provider: .claude).last!
+require(proxyCodex0.displayName == "CodexCLI0" && proxyCodex1.displayName == "CodexCLI1" &&
+        proxyClaude0.displayName == "ClaudeCLI0", "CLIProxy profiles number independently by provider")
+let nativeEntryStore = CLIEntryStore(applicationSupportDirectory: testRoot)
+require(proxyStore.rootURL.appendingPathComponent("profiles.json").path != nativeEntryStore.fileURL.path,
+        "CLIProxy profile records do not share the native CLI entry store")
+let loadedProxyProfiles = try proxyStore.load()
+require(loadedProxyProfiles.count == 3, "CLIProxy profiles persist in their separate store")
+do {
+    _ = try proxyStore.add(provider: .antigravity)
+    fatalError("deferred Antigravity OAuth unexpectedly registered")
+} catch CLIProxyProfileStore.StoreError.providerUnavailable {}
+_ = try proxyStore.remove(id: proxyCodex0.id)
+let proxyCodexReused = try proxyStore.add(provider: .codex).last!
+require(proxyCodexReused.ordinal == 0 && proxyCodexReused.id != proxyCodex0.id,
+        "CLIProxy reuses the smallest ordinal with a fresh UUID after removal")
+let proxyAuthRoot = testRoot.appendingPathComponent("PainelCli/CLIProxy/instances/\(proxyCodex1.id.uuidString)/auths")
+let proxyConfig = CLIProxyConfiguration.yaml(port: 49152, managementKey: "synthetic-management-secret",
+                                             clientKey: "synthetic-client-secret", authDirectory: proxyAuthRoot)
+require(proxyConfig.contains("host: 127.0.0.1") && proxyConfig.contains("allow-remote: false") &&
+        proxyConfig.contains("disable-control-panel: true") && proxyConfig.contains(proxyAuthRoot.path) &&
+        proxyConfig.contains("synthetic-client-secret"),
+        "CLIProxy config binds loopback, disables remote management/panel, and scopes auth by UUID")
+require(CLIProxyConfiguration.accountState(provider: .codex, files: [["provider": "codex", "status": "active"]]) == .authenticated &&
+        CLIProxyConfiguration.accountState(provider: .claude, files: []) == .unauthenticated &&
+        CLIProxyConfiguration.accountState(provider: .codex, files: [["provider": "codex", "status": "error"]]) == .indeterminate &&
+        CLIProxyConfiguration.accountState(provider: .codex, files: [["provider": "codex", "status": "active", "disabled": true]]) == .indeterminate &&
+        CLIProxyConfiguration.accountState(provider: .antigravity, files: [["provider": "antigravity", "status": "active"]]) == .indeterminate,
+        "CLIProxy account evidence is provider-scoped and accepts only ready OAuth auth files")
+let fakeBundledEngine = Data("synthetic patched engine".utf8)
+let fakeBundledEngineDigest = CLIProxyManager.sha256(fakeBundledEngine)
+require(CLIProxyManager.validatesBundledEngine(fakeBundledEngine, expectedDigest: fakeBundledEngineDigest) &&
+        !CLIProxyManager.validatesBundledEngine(fakeBundledEngine, expectedDigest: String(repeating: "0", count: 64)),
+        "CLIProxy accepts only the engine matching the app bundle's SHA-256")
+require(CLIProxyManager.validOAuthURL("https://auth.openai.com/oauth/authorize", provider: .codex) != nil &&
+        CLIProxyManager.validOAuthURL("https://claude.ai/oauth/authorize", provider: .claude) != nil &&
+        CLIProxyManager.validOAuthURL("http://auth.openai.com/oauth/authorize", provider: .codex) == nil &&
+        CLIProxyManager.validOAuthURL("https://example.test/oauth/authorize", provider: .codex) == nil &&
+        CLIProxyManager.validOAuthURL("https://user@claude.ai/oauth/authorize", provider: .claude) == nil &&
+        CLIProxyManager.validOAuthURL("https://auth.openai.com:444/oauth/authorize", provider: .codex) == nil,
+        "CLIProxy opens only the provider-specific HTTPS OAuth origin")
+let bundledEngineFolder = testRoot.appendingPathComponent("SyntheticBundle", isDirectory: true)
+let bundledEngineURL = bundledEngineFolder.appendingPathComponent("CLIProxyAPI")
+try FileManager.default.createDirectory(at: bundledEngineFolder, withIntermediateDirectories: true)
+try fakeBundledEngine.write(to: bundledEngineURL)
+try Data((fakeBundledEngineDigest + "\n").utf8).write(to: bundledEngineURL.appendingPathExtension("sha256"))
+let syntheticProxyManager = CLIProxyManager(applicationSupportDirectory: testRoot,
+                                            bundledEngineURL: bundledEngineURL)
+try syntheticProxyManager.installEngine()
+try syntheticProxyManager.prepare(profile: proxyCodex1)
+require(syntheticProxyManager.engineInstalled() && syntheticProxyManager.isPrepared(profile: proxyCodex1) &&
+        FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("PainelCli/CLIProxy/instances/\(proxyCodex1.id.uuidString)/auths").path),
+        "CLIProxy installs only a digest-verified app-bundled engine and prepares private UUID-scoped files without launching it")
+try Data("tampered engine".utf8).write(to: syntheticProxyManager.engineURL)
+try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: syntheticProxyManager.engineURL.path)
+require(!syntheticProxyManager.engineInstalled(), "CLIProxy rejects a modified installed engine by digest")
+try syntheticProxyManager.installEngine()
+require(syntheticProxyManager.engineInstalled(), "CLIProxy can restore its bundled engine after tampering")
+let oauthLockManagerA = CLIProxyManager(applicationSupportDirectory: testRoot, bundledEngineURL: bundledEngineURL)
+let oauthLockManagerB = CLIProxyManager(applicationSupportDirectory: testRoot, bundledEngineURL: bundledEngineURL)
+try oauthLockManagerA.acquireOAuthLease(profile: proxyCodex1)
+do {
+    try oauthLockManagerB.acquireOAuthLease(profile: proxyCodexReused)
+    fatalError("parallel Codex OAuth lease unexpectedly acquired")
+} catch CLIProxyManagerError.oauthAlreadyInProgress {}
+oauthLockManagerA.releaseOAuthLease(profile: proxyCodex1)
+try oauthLockManagerB.acquireOAuthLease(profile: proxyCodexReused)
+oauthLockManagerB.releaseOAuthLease(profile: proxyCodexReused)
 
 // Manual numbering starts at zero independently per provider. Detections never occupy ordinals.
 let store = CLIEntryStore(applicationSupportDirectory: testRoot)

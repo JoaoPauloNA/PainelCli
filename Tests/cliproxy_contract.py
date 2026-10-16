@@ -1,82 +1,86 @@
 #!/usr/bin/env python3
-"""Static contract for the manual, UUID-verified CLIProxy-ready list."""
+"""Static contract for independent, loopback-only CLIProxy profiles."""
 from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parents[1]
-source = (root / "Sources/main.swift").read_text(encoding="utf-8")
-store = (root / "Sources/CLIEntryStore.swift").read_text(encoding="utf-8")
+source = (root / "Sources/CLIProxy.swift").read_text(encoding="utf-8")
+ui = (root / "Sources/main.swift").read_text(encoding="utf-8")
+patch_text = (root / "Resources/CLIProxyAPI-loopback.patch").read_text(encoding="utf-8")
+added_patch = "\n".join(line[1:] for line in patch_text.splitlines()
+                          if line.startswith("+") and not line.startswith("+++"))
 failures: list[str] = []
 
-def block(start: str, end: str, text: str = source) -> str:
-    first = text.find(start)
-    last = text.find(end, first + len(start)) if first >= 0 else -1
-    return text[first:last] if first >= 0 and last > first else ""
-
-proxy_renderer = block("private func renderCLIProxy(in body: NSView)",
-                       "private func addCLIProxyEmptyMessage")
-ready_filter = block("enum CLIProxyReadiness", "struct CLIEntryStore", store)
-current_ready = block("private func currentCLIProxyReadyEntries()", "private func cliSymbol()")
-status_refresh = block("private func refreshAuthenticationStatuses(forceIDs:",
-                        "private func beginCLIProxyStatusRefresh")
-proxy_refresh = block("private func beginCLIProxyStatusRefresh()", "private func refreshCLIProxySnapshotIfVisible")
-manual_reload = block("private func reloadManualRegistrationsForCLIProxy()", "@objc private func removeCLI")
-show_proxy = block("@objc private func showCLIProxy()", "@objc func openWindow()")
-
-for text, message in [
-    ("currentCLIProxyReadyEntries()", "CLIProxy rows are not derived from current installation state"),
-    (".loading", "CLIProxy screen lacks a loading state"),
-    ("case .loaded", "CLIProxy screen lacks a resolved state"),
-    ("storageUnavailable", "CLIProxy screen lacks a storage failure state"),
-    ("Nenhuma CLI manual está instalada e autenticada", "CLIProxy empty state is unclear"),
-]:
-    if text not in proxy_renderer:
+def require(condition: bool, message: str) -> None:
+    if not condition:
         failures.append(message)
-if "automaticInstallations" in proxy_renderer or "detections" in proxy_renderer or "listItems" in proxy_renderer:
-    failures.append("CLIProxy presentation mixes detected or global installations into its list")
-if "entryStore.load()" not in manual_reload or "detectedInstallations" in manual_reload:
-    failures.append("opening CLIProxy reads global executable discovery instead of manual records only")
-if "reloadManualRegistrationsForCLIProxy()" not in show_proxy or "beginCLIProxyStatusRefresh()" not in show_proxy:
-    failures.append("opening CLIProxy does not refresh its manual rows and isolated statuses")
-if "CLIProxyReadiness.readyEntries" not in current_ready or "entry.origin == .manual" not in ready_filter or \
-        "entry.provider == CLIProvider.codex.rawValue" not in ready_filter or \
-        "entry.provider == CLIProvider.claude.rawValue" not in ready_filter or \
-        "installedIDs.contains(entry.id)" not in ready_filter or \
-        "authenticationStates[entry.id] == .authenticated" not in ready_filter:
-    failures.append("readiness filter does not require manual Codex/Claude, installed UUID, and confirmed authentication")
-if "CLIProvider.antigravity.rawValue" in ready_filter:
-    failures.append("Antigravity is included despite its deferred authentication support")
-if "registrationInstallStatus(for: $0) == .installed" not in proxy_refresh or \
-        "authenticationProcesses[$0.id]?.isRunning != true" not in proxy_refresh:
-    failures.append("status refresh does not require an installed, idle managed registration")
-if "service.authenticationStatus(for: entry)" not in status_refresh or \
-        "service.claudeAuthenticationStatus(for: entry)" not in status_refresh or \
-        "entry.provider == CLIProvider.claude.rawValue" not in status_refresh:
-    failures.append("status refresh does not use the provider's existing UUID-isolated contract")
-if "agy" in status_refresh or "Antigravity" in status_refresh or "keychain" in status_refresh.lower():
-    failures.append("CLIProxy status refresh attempts unsupported Antigravity or credential-store inspection")
-if "authenticationCheckRevisions[entry.id] == revision" not in status_refresh:
-    failures.append("late status responses can restore a stale authenticated snapshot")
 
-for selector, method_name in [
-    ("@objc private func removeCLI", "remove"),
-    ("@objc private func installCLI", "install"),
-    ("@objc private func loginCLI", "login"),
-    ("@objc private func logoutCLI", "logout"),
-    ("@objc private func uninstallCLI", "uninstall"),
-]:
-    next_selector = source.find("@objc private func ", source.find(selector) + len(selector))
-    first = source.find(selector)
-    handler = source[first:next_selector] if first >= 0 and next_selector > first else ""
-    if "invalidateAuthenticationCheck(for: entry.id)" not in handler:
-        failures.append(f"{method_name} does not invalidate an older per-UUID status result")
-    if method_name in {"remove", "install", "logout", "uninstall"} and \
-            "refreshCLIProxySnapshotIfVisible()" not in handler:
-        failures.append(f"{method_name} does not refresh the visible CLIProxy snapshot after completion")
+profile_store = source[source.index("struct CLIProxyProfileStore"):source.index("private extension JSONEncoder")]
+manager = source[source.index("final class CLIProxyManager"):]
+proxy_ui = ui[ui.index("private func renderCLIProxy(in body:"):ui.index("private func detectedAppearance(for target:")]
+visible_refresh = ui[ui.index("private func refreshEntriesForVisibleSection()"):ui.index("private func invalidateAuthenticationCheck")]
+show_proxy = ui[ui.index("@objc private func showCLIProxy()"):ui.index("@objc func openWindow()")]
+
+require('"profiles.json"' in profile_store and '"instances"' not in profile_store,
+        "CLIProxy keeps profile metadata in its own profile store")
+require("CLIProxyProfile(provider: provider" in profile_store and "while used.contains(ordinal)" in profile_store,
+        "CLIProxy creates its own UUIDs and smallest-free per-provider ordinals")
+require("provider.supported" in profile_store and "var supported: Bool { self != .antigravity }" in source,
+        "Antigravity remains unavailable in the CLIProxy catalog")
+require("host: 127.0.0.1" in source and "allow-remote: false" in source and
+        "disable-control-panel: true" in source and "auth-dir:" in source,
+        "proxy configuration is loopback-only with a private UUID-scoped auth directory")
+require("Bundle.main.url(forResource: \"CLIProxyAPI\"" in source and
+        "validatesBundledEngine" in manager and "GitHubCLIProxyArtifactLoader" not in source,
+        "runtime installs only the digest-verified app-bundled patched engine")
+require("/v8/management/oauth/auth-url" not in source and 'route: "oauth/auth-url"' in source and
+        'route: "oauth/status"' in source and 'route: "oauth/session"' in source and
+        'route: "credentials"' in source,
+        "management calls use the maintained v8 OAuth and credential routes")
+require("flock(descriptor, LOCK_EX | LOCK_NB)" in source and "oauth-\\(provider).lock" in source,
+        "fixed provider callback ports are serialized across profiles and app processes")
+require("auth.openai.com" in source and "claude.ai" in source and
+        "components.scheme?.lowercased() == \"https\"" in source,
+        "OAuth URLs require HTTPS and the expected provider host")
+require('($0["status"] as? String)?.lowercased() == "active"' in source and
+        '($0["disabled"] as? Bool) != true' in source and
+        '($0["unavailable"] as? Bool) != true' in source,
+        "profile readiness reads the engine's active credential state rather than native CLIs")
+require("try stop(profile: profile)" in manager and "processIdentityMatches(record)" in manager,
+        "profile removal stops only its verified process")
+require("currentCLIProxyReadyEntries" not in proxy_ui and "CLIEntry" not in proxy_ui and
+        "entries" not in proxy_ui and "CLIProvider" not in proxy_ui and
+        "cliProxyProfiles" in proxy_ui and "openCLIProxyCatalog" in proxy_ui,
+        "CLIProxy UI uses only its own profile collection and catalog")
+require("Antigravity" in proxy_ui and "Indisponível" in proxy_ui,
+        "CLIProxy catalog explicitly disables Antigravity")
+for action in ["prepareCLIProxyProfile", "activateCLIProxyProfile", "stopCLIProxyProfile",
+               "loginCLIProxyProfile", "checkCLIProxyOAuth", "cancelCLIProxyOAuth",
+               "removeCLIProxyProfile"]:
+    require(f"@objc private func {action}" in ui, f"CLIProxy action {action} is wired")
+require("reloadCLIProxyProfiles()" in show_proxy and "refreshCLIProxyStatuses()" in show_proxy and
+        "reloadManualRegistrationsForCLIProxy" not in show_proxy,
+        "opening CLIProxy loads and refreshes only its own collection")
+require("selectedSettingsSection == .add" in visible_refresh and "cliProxyProfiles" not in visible_refresh,
+        "native CLI refresh never populates the CLIProxy profile list")
+
+require('net.LookupIP("localhost")' in added_patch and "address.IsLoopback()" in added_patch and
+        "Serve(listener)" in added_patch and "0.0.0.0" not in added_patch and
+        'http://localhost:%d' not in added_patch,
+        "the upstream patch binds every OAuth listener to verified loopback addresses and preserves redirects")
+
+# Visual contract: independent profile presentation must follow the compact actions pattern.
+require("applyActionAppearance(button)" in proxy_ui and "button.toolTip =" in proxy_ui and
+        "button.setAccessibilityLabel" in proxy_ui,
+        "proxy actions use shared icon-only styling and accessible names")
+require("proxyProviderAppearance" in proxy_ui and "identity.widthAnchor.constraint(equalToConstant: 150)" not in proxy_ui,
+        "proxy provider identity stays recognizable and resizes with the list")
+require("applyActionAppearance(remove)" in proxy_ui and "remove.contentTintColor = .systemRed" in proxy_ui,
+        "proxy removal uses the shared compact red-trash presentation")
 
 if failures:
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
     raise SystemExit(1)
 
-print("CLIProxy contract passed: manual UUIDs only, installed and authenticated, stale results rejected.")
+print("CLIProxy contract passed: separate profiles, patched engine, loopback OAuth, and profile actions.")

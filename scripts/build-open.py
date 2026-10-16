@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Compila localmente, mantém atual/anterior e abre uma única instância."""
+import hashlib
 import os
 from pathlib import Path
 import plistlib
@@ -10,10 +11,18 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "0.0.0.34"
+VERSION = "0.0.0.35"
 RELEASES = ROOT / "releases"
 CURRENT = RELEASES / "PainelCli.app"
 PREVIOUS = RELEASES / "PainelCli-anterior.app"
+
+ENGINE = ROOT / "Resources/CLIProxyAPI"
+ENGINE_DIGEST = ROOT / "Resources/CLIProxyAPI.sha256"
+ENGINE_LICENSE = ROOT / "Resources/CLIProxyAPI-LICENSE.txt"
+if not ENGINE.is_file() or not ENGINE_DIGEST.is_file() or not ENGINE_LICENSE.is_file():
+    raise RuntimeError("Build the privately patched CLIProxyAPI engine first with scripts/build-cliproxy-engine.sh")
+if hashlib.sha256(ENGINE.read_bytes()).hexdigest() != ENGINE_DIGEST.read_text(encoding="utf-8").strip():
+    raise RuntimeError("The bundled CLIProxyAPI engine does not match its SHA-256 manifest")
 
 def pids(bundle):
     executable = str(bundle / "Contents/MacOS/PainelCli")
@@ -40,7 +49,8 @@ RELEASES.mkdir(exist_ok=True)
 with tempfile.TemporaryDirectory(prefix=".build-", dir=ROOT) as temporary:
     binary = Path(temporary) / "PainelCli"
     subprocess.run(["xcrun", "swiftc", str(ROOT / "Sources/CLIEntryStore.swift"),
-                    str(ROOT / "Sources/CLIInstaller.swift"), str(ROOT / "Sources/main.swift"),
+                    str(ROOT / "Sources/CLIInstaller.swift"), str(ROOT / "Sources/CLIProxy.swift"),
+                    str(ROOT / "Sources/main.swift"),
                     "-o", str(binary), "-framework", "AppKit"], check=True)
     print("Compilação concluída", flush=True)
     stop(CURRENT)
@@ -55,6 +65,9 @@ with tempfile.TemporaryDirectory(prefix=".build-", dir=ROOT) as temporary:
         shutil.copy2(binary, contents / "MacOS/PainelCli")
         (contents / "Resources").mkdir()
         shutil.copy2(ROOT / "Resources/AppIcon.icns", contents / "Resources/AppIcon.icns")
+        shutil.copy2(ENGINE, contents / "Resources/CLIProxyAPI")
+        shutil.copy2(ENGINE_DIGEST, contents / "Resources/CLIProxyAPI.sha256")
+        shutil.copy2(ENGINE_LICENSE, contents / "Resources/CLIProxyAPI-LICENSE.txt")
         with (contents / "Info.plist").open("wb") as output:
             plistlib.dump({"CFBundleExecutable": "PainelCli", "CFBundleName": "PainelCli",
                 "CFBundleIdentifier": "app.painelcli.desktop", "CFBundlePackageType": "APPL",

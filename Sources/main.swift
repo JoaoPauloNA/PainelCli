@@ -3,9 +3,7 @@ import AppKit
 private enum Screen { case home, settings }
 private enum SettingsSection { case add, cliProxy }
 private enum CLIProxyViewState { case idle, loading, loaded, storageUnavailable }
-private enum CLIPackageCatalog {
-    static let candidates = CLIProvider.allCases
-}
+private enum CLIPackageCatalog { static let candidates = CLIProvider.allCases }
 
 private func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular,
                    color: NSColor = .labelColor) -> NSTextField {
@@ -77,8 +75,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var catalogWindow: NSWindow?
     private var catalogStatusLabel: NSTextField?
     private var selectedSettingsSection: SettingsSection = .add
+    private let cliProxyQueue = DispatchQueue(label: "app.painelcli.cliprpxy", qos: .userInitiated)
     private var entryStore: CLIEntryStore?
     private var installService: CLIInstallService?
+    private var cliProxyManager: CLIProxyManager?
+    private var cliProxyProfiles: [CLIProxyProfile] = []
+    private var cliProxyProcessStates: [UUID: CLIProxyProcessState] = [:]
+    private var cliProxyAccountStates: [UUID: CLIProxyAccountState] = [:]
+    private var cliProxyBusyIDs = Set<UUID>()
+    private var cliProxyMessages: [UUID: String] = [:]
+    private var cliProxyOAuthLogins: [UUID: CLIProxyOAuthLogin] = [:]
+    private var showingCLIProxyCatalog = false
     private var entries: [CLIEntry] = []
     private var detections: [CLIDiscovery] = []
     private var automaticInstallations: [CLIAutomaticInstallation] = []
@@ -97,8 +104,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private var storageLoadFailed = false
     private var cliProxyViewState: CLIProxyViewState = .idle
-    private var cliProxyPendingIDs = Set<UUID>()
-    private var cliProxyHadIndeterminateStatus = false
 
     private func navigationButton(_ title: String, symbol: String, action: Selector,
                                   selected: Bool) -> NSButton {
@@ -291,10 +296,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func renderCLIProxy(in body: NSView) {
         let title = label("CLIProxy", size: 22, weight: .semibold)
-        let subtitle = label("CLIs instaladas e autenticadas nos seus cadastros do PainelCli.",
+        let subtitle = label("Perfis independentes, com autenticação própria por provedor.",
                              size: 12, color: .secondaryLabelColor)
+        let addButton = NSButton(image: NSImage(systemSymbolName: "plus", accessibilityDescription: "Adicionar perfil CLIProxy")!,
+                                 target: self, action: #selector(openCLIProxyCatalog))
+        addButton.bezelStyle = .rounded
+        addButton.toolTip = "Adicionar perfil CLIProxy"
+        addButton.setAccessibilityLabel("Adicionar perfil CLIProxy")
+        addButton.translatesAutoresizingMaskIntoConstraints = false
         body.addSubview(title)
+        subtitle.lineBreakMode = .byTruncatingTail
+        subtitle.toolTip = subtitle.stringValue
         body.addSubview(subtitle)
+        body.addSubview(addButton)
 
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -315,7 +329,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLayoutConstraint.activate([
             title.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 24),
             title.topAnchor.constraint(equalTo: body.topAnchor, constant: 24),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: body.trailingAnchor, constant: -24),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -16),
+            addButton.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -24),
+            addButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            addButton.widthAnchor.constraint(equalToConstant: 36),
+            addButton.heightAnchor.constraint(equalToConstant: 32),
             subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
             subtitle.trailingAnchor.constraint(lessThanOrEqualTo: body.trailingAnchor, constant: -24),
@@ -342,59 +360,228 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             spinner.controlSize = .small
             spinner.isIndeterminate = true
             spinner.startAnimation(nil)
-            let message = label("Verificando o estado isolado das CLIs…", size: 13,
+            let message = label("Carregando perfis CLIProxy…", size: 13,
                                 color: .secondaryLabelColor)
             loadingRow.addArrangedSubview(spinner)
             loadingRow.addArrangedSubview(message)
             stack.addArrangedSubview(loadingRow)
             loadingRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         case .storageUnavailable:
-            addCLIProxyEmptyMessage("Não foi possível carregar os cadastros salvos. Nenhuma CLI foi listada.",
+            addCLIProxyEmptyMessage("Não foi possível carregar os perfis CLIProxy salvos.",
                                     to: stack)
         case .loaded:
-            let readyEntries = currentCLIProxyReadyEntries()
-            guard !readyEntries.isEmpty else {
-                let message = cliProxyHadIndeterminateStatus
-                    ? "Não foi possível confirmar algumas autenticações. Essas CLIs foram omitidas da lista."
-                    : "Nenhuma CLI manual está instalada e autenticada para o CLIProxy."
-                addCLIProxyEmptyMessage(message, to: stack)
+            if showingCLIProxyCatalog {
+                let back = cliProxyButton("Voltar aos perfis", #selector(closeCLIProxyCatalog), tag: 0)
+                stack.addArrangedSubview(back)
+                stack.setCustomSpacing(12, after: back)
+                addCLIProxyCatalogRow("Codex", "Login próprio do CLIProxy", 0, enabled: true, to: stack)
+                addCLIProxyCatalogRow("Claude", "Login próprio do CLIProxy", 1, enabled: true, to: stack)
+                addCLIProxyCatalogRow("Antigravity", "Login ainda indisponível", 2, enabled: false, to: stack)
                 return
             }
-            for entry in readyEntries {
-                guard let target = CLIDiscoveryTarget(rawValue: entry.provider) else { continue }
-                let row = NSView()
-                row.translatesAutoresizingMaskIntoConstraints = false
-                row.heightAnchor.constraint(equalToConstant: 56).isActive = true
-                let appearance = detectedAppearance(for: target)
-                let icon = NSImageView()
-                icon.image = appearance.0
-                icon.contentTintColor = appearance.1
-                icon.imageScaling = .scaleProportionallyUpOrDown
-                icon.setAccessibilityElement(false)
-                icon.translatesAutoresizingMaskIntoConstraints = false
-                let name = label(entry.displayName, size: 13, weight: .medium)
-                let ready = label("Pronta", size: 11, color: .secondaryLabelColor)
-                let separator = Surface(.separatorColor)
-                [icon, name, ready, separator].forEach { row.addSubview($0) }
-                NSLayoutConstraint.activate([
-                    icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 4),
-                    icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                    icon.widthAnchor.constraint(equalToConstant: 18),
-                    icon.heightAnchor.constraint(equalToConstant: 18),
-                    name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-                    name.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                    ready.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
-                    ready.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                    name.trailingAnchor.constraint(lessThanOrEqualTo: ready.leadingAnchor, constant: -12),
-                    separator.leadingAnchor.constraint(equalTo: name.leadingAnchor),
-                    separator.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-                    separator.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-                    separator.heightAnchor.constraint(equalToConstant: 1)
-                ])
-                row.setAccessibilityElement(true)
-                row.setAccessibilityLabel("\(entry.displayName), pronta para CLIProxy")
-                stack.addArrangedSubview(row)
-                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            guard !cliProxyProfiles.isEmpty else {
+                addCLIProxyEmptyMessage("Ainda não há perfis. Use + para escolher Codex ou Claude.", to: stack)
+                return
+            }
+            for (index, profile) in cliProxyProfiles.enumerated() { addCLIProxyProfileRow(profile, index, to: stack) }
+        }
+    }
+
+    private func proxyProviderAppearance(_ provider: CLIProxyProvider) -> (NSImage?, NSColor) {
+        switch provider {
+        case .codex: return detectedAppearance(for: .codex)
+        case .claude: return detectedAppearance(for: .claude)
+        case .antigravity: return detectedAppearance(for: .antigravity)
+        }
+    }
+
+    private func addCLIProxySeparator(to stack: NSStackView) {
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        stack.addArrangedSubview(separator)
+        separator.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+    }
+
+    private func addCLIProxyCatalogRow(_ title: String, _ detail: String, _ provider: Int,
+                                       enabled: Bool, to stack: NSStackView) {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 12
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        let name = label(title, size: 14, weight: .medium)
+        let description = label(detail, size: 11, color: .secondaryLabelColor)
+        name.textColor = enabled ? .labelColor : .disabledControlTextColor
+        description.lineBreakMode = .byTruncatingTail
+        description.toolTip = detail
+        text.addArrangedSubview(name)
+        text.addArrangedSubview(description)
+        let providerType: CLIProxyProvider = provider == 0 ? .codex : provider == 1 ? .claude : .antigravity
+        let appearance = proxyProviderAppearance(providerType)
+        let icon = NSImageView()
+        icon.image = appearance.0
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.contentTintColor = enabled ? appearance.1 : .disabledControlTextColor
+        icon.setAccessibilityElement(false)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        let add = cliProxyButton(enabled ? "Adicionar" : "Indisponível",
+                                 #selector(addCLIProxyProfile(_:)), tag: provider)
+        add.isEnabled = enabled
+        add.contentTintColor = enabled ? .controlAccentColor : .disabledControlTextColor
+        add.toolTip = enabled ? "Adicionar perfil \(title)" : "Antigravity · login indisponível"
+        add.setAccessibilityLabel(enabled ? "Adicionar perfil \(title)" : "Antigravity indisponível")
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(text)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(add)
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 72).isActive = true
+        addCLIProxySeparator(to: stack)
+    }
+
+    private func addCLIProxyProfileRow(_ profile: CLIProxyProfile, _ index: Int, to stack: NSStackView) {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let identity = NSStackView()
+        identity.orientation = .vertical
+        identity.alignment = .leading
+        identity.spacing = 3
+        let name = label(profile.displayName, size: 13, weight: .medium)
+        let statusText = cliProxyStatusText(profile)
+        let status = label(statusText, size: 11, color: .secondaryLabelColor)
+        for text in [name, status] {
+            text.lineBreakMode = .byTruncatingTail
+            text.maximumNumberOfLines = 1
+            text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            identity.addArrangedSubview(text)
+        }
+        status.toolTip = statusText
+        status.setAccessibilityValue(statusText)
+        identity.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        identity.widthAnchor.constraint(greaterThanOrEqualToConstant: 80).isActive = true
+        let appearance = proxyProviderAppearance(profile.provider)
+        let icon = NSImageView()
+        icon.image = appearance.0
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.contentTintColor = appearance.1
+        icon.setAccessibilityElement(false)
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(identity)
+        row.addArrangedSubview(NSView())
+        if cliProxyBusyIDs.contains(profile.id) {
+            let spinner = NSProgressIndicator()
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isIndeterminate = true
+            spinner.toolTip = "Operação do perfil em andamento"
+            spinner.setAccessibilityLabel("Operação do perfil em andamento")
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            spinner.widthAnchor.constraint(equalToConstant: 16).isActive = true
+            spinner.heightAnchor.constraint(equalToConstant: 16).isActive = true
+            spinner.startAnimation(nil)
+            row.addArrangedSubview(spinner)
+        } else {
+            switch cliProxyProcessStates[profile.id] ?? .stopped {
+            case .stopped:
+                if cliProxyManager?.isPrepared(profile: profile) == true {
+                    row.addArrangedSubview(cliProxyButton("Ativar", #selector(activateCLIProxyProfile(_:)), tag: index))
+                } else {
+                    row.addArrangedSubview(cliProxyButton("Preparar", #selector(prepareCLIProxyProfile(_:)), tag: index))
+                }
+            case .running:
+                row.addArrangedSubview(cliProxyButton("Parar", #selector(stopCLIProxyProfile(_:)), tag: index))
+                if cliProxyOAuthLogins[profile.id] != nil {
+                    row.addArrangedSubview(cliProxyButton("Verificar", #selector(checkCLIProxyOAuth(_:)), tag: index))
+                    row.addArrangedSubview(cliProxyButton("Cancelar", #selector(cancelCLIProxyOAuth(_:)), tag: index))
+                } else if cliProxyAccountStates[profile.id] != .authenticated {
+                    row.addArrangedSubview(cliProxyButton("Login", #selector(loginCLIProxyProfile(_:)), tag: index))
+                }
+                row.addArrangedSubview(cliProxyButton("Atualizar", #selector(refreshCLIProxyProfile(_:)), tag: index))
+            case .indeterminate:
+                row.addArrangedSubview(cliProxyButton("Atualizar", #selector(refreshCLIProxyProfile(_:)), tag: index))
+            }
+            let remove = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: "Remover perfil")!,
+                                  target: self, action: #selector(removeCLIProxyProfile(_:)))
+            remove.tag = index
+            applyActionAppearance(remove)
+            remove.contentTintColor = .systemRed
+            remove.translatesAutoresizingMaskIntoConstraints = false
+            remove.widthAnchor.constraint(equalToConstant: 28).isActive = true
+            remove.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            remove.toolTip = "Remover perfil CLIProxy"
+            remove.setAccessibilityLabel("Remover \(profile.displayName)")
+            row.addArrangedSubview(remove)
+        }
+        stack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 56).isActive = true
+        if let message = cliProxyMessages[profile.id] {
+            let detail = label(message, size: 11, color: .systemRed)
+            detail.lineBreakMode = .byTruncatingTail
+            detail.maximumNumberOfLines = 2
+            detail.toolTip = message
+            detail.setAccessibilityValue(message)
+            stack.addArrangedSubview(detail)
+            detail.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        addCLIProxySeparator(to: stack)
+    }
+
+    private func cliProxyButton(_ title: String, _ action: Selector, tag: Int) -> NSButton {
+        let symbol: String
+        let tint: NSColor
+        switch title {
+        case "Voltar aos perfis": symbol = "arrow.left"; tint = .secondaryLabelColor
+        case "Adicionar": symbol = "plus.circle"; tint = .controlAccentColor
+        case "Indisponível": symbol = "lock"; tint = .disabledControlTextColor
+        case "Preparar": symbol = "shippingbox"; tint = .controlAccentColor
+        case "Ativar": symbol = "play.circle"; tint = .systemGreen
+        case "Parar": symbol = "stop.circle"; tint = .systemOrange
+        case "Login": symbol = "person.crop.circle"; tint = .systemGreen
+        case "Verificar": symbol = "checkmark.circle"; tint = .controlAccentColor
+        case "Cancelar": symbol = "xmark.circle"; tint = .systemOrange
+        default: symbol = "arrow.clockwise"; tint = .secondaryLabelColor
+        }
+        let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage(),
+                              target: self, action: action)
+        button.tag = tag
+        applyActionAppearance(button)
+        button.contentTintColor = tint
+        button.toolTip = title
+        button.setAccessibilityLabel("\(title) · CLIProxy")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        return button
+    }
+
+    private func cliProxyStatusText(_ profile: CLIProxyProfile) -> String {
+        switch cliProxyProcessStates[profile.id] ?? .stopped {
+        case .stopped:
+            if cliProxyOAuthLogins[profile.id] != nil { return "Login aguardando" }
+            return cliProxyAccountStates[profile.id] == .authenticated ? "Login configurado · inativo" : "Inativo"
+        case .indeterminate:
+            return "Estado do processo não confirmado"
+        case .running:
+            switch cliProxyAccountStates[profile.id] {
+            case .authenticated: return "Ativo · login configurado"
+            case .unauthenticated: return "Ativo · faça login"
+            case .indeterminate, .none: return "Ativo · estado de login desconhecido"
             }
         }
     }
@@ -405,20 +592,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         notice.textColor = .secondaryLabelColor
         stack.addArrangedSubview(notice)
         notice.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-    }
-
-    private func currentCLIProxyReadyEntries() -> [CLIEntry] {
-        guard let installService else { return [] }
-        let installedIDs = Set(entries.compactMap { entry -> UUID? in
-            guard entry.origin == .manual,
-                  !installingRegistrationIDs.contains(entry.id),
-                  !activeLogoutIDs.contains(entry.id),
-                  !activeRemovalIDs.contains(entry.id),
-                  installService.registrationInstallStatus(for: entry) == .installed else { return nil }
-            return entry.id
-        })
-        return CLIProxyReadiness.readyEntries(entries, installedIDs: installedIDs,
-                                              authenticationStates: authenticationStates)
     }
 
     private func cliSymbol() -> NSImage? {
@@ -908,11 +1081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshEntriesForVisibleSection() {
-        if selectedSettingsSection == .cliProxy {
-            reloadManualRegistrationsForCLIProxy()
-        } else {
-            refreshCLIEntries()
-        }
+        if selectedSettingsSection == .add { refreshCLIEntries() }
     }
 
     private func invalidateAuthenticationCheck(for id: UUID) {
@@ -959,67 +1128,269 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           self.authenticationCheckRevisions[entry.id] == revision else { return }
                     self.checkingAuthenticationIDs.remove(entry.id)
                     self.authenticationStates[entry.id] = state
-                    if self.cliProxyPendingIDs.remove(entry.id) != nil {
-                        if case .statusError = state { self.cliProxyHadIndeterminateStatus = true }
-                        if self.cliProxyPendingIDs.isEmpty { self.cliProxyViewState = .loaded }
-                    }
                     if self.settingsButton.state == .on { self.render(.settings) }
                 }
             }
         }
     }
 
-    private func beginCLIProxyStatusRefresh() {
-        guard selectedSettingsSection == .cliProxy else { return }
-        guard !storageLoadFailed, let installService else {
-            cliProxyViewState = .storageUnavailable
-            cliProxyPendingIDs.removeAll()
-            render(.settings)
-            return
-        }
-        cliProxyHadIndeterminateStatus = false
-        let eligible = entries.filter {
-            $0.origin == .manual &&
-            ($0.provider == CLIProvider.codex.rawValue || $0.provider == CLIProvider.claude.rawValue) &&
-            !installingRegistrationIDs.contains($0.id) &&
-            !activeLogoutIDs.contains($0.id) &&
-            !activeRemovalIDs.contains($0.id) &&
-            !isAuthenticationRunningState(authenticationUIState(for: $0)) &&
-            authenticationProcesses[$0.id]?.isRunning != true &&
-            installService.registrationInstallStatus(for: $0) == .installed
-        }
-        cliProxyPendingIDs = Set(eligible.map(\.id))
-        guard !eligible.isEmpty else {
-            cliProxyViewState = .loaded
-            render(.settings)
-            return
-        }
-        cliProxyViewState = .loading
-        for entry in eligible { invalidateAuthenticationCheck(for: entry.id) }
-        render(.settings)
-        refreshAuthenticationStatuses(forceIDs: Set(eligible.map(\.id)))
-    }
-
     private func refreshCLIProxySnapshotIfVisible() {
         guard settingsButton?.state == .on, selectedSettingsSection == .cliProxy else { return }
-        reloadManualRegistrationsForCLIProxy()
-        beginCLIProxyStatusRefresh()
+        reloadCLIProxyProfiles()
+        refreshCLIProxyStatuses()
     }
 
-    private func reloadManualRegistrationsForCLIProxy() {
-        guard let entryStore else {
-            storageLoadFailed = true
-            return
-        }
+    private func ensureCLIProxyManager() -> Bool {
+        if cliProxyManager != nil { return true }
         do {
-            entries = try entryStore.load()
-            storageLoadFailed = false
-            let currentIDs = Set(entries.map(\.id))
-            for id in Array(authenticationStates.keys) where !currentIDs.contains(id) {
-                invalidateAuthenticationCheck(for: id)
-            }
+            let support = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                       appropriateFor: nil, create: true)
+            cliProxyManager = CLIProxyManager(applicationSupportDirectory: support)
+            return true
         } catch {
-            storageLoadFailed = true
+            cliProxyViewState = .storageUnavailable
+            return false
+        }
+    }
+
+    private func reloadCLIProxyProfiles() {
+        guard ensureCLIProxyManager(), let manager = cliProxyManager else { return }
+        do {
+            cliProxyProfiles = try manager.store.load()
+            cliProxyProfiles.forEach {
+                if cliProxyProcessStates[$0.id] == nil { cliProxyProcessStates[$0.id] = .stopped }
+            }
+            let currentIDs = Set(cliProxyProfiles.map(\.id))
+            cliProxyProcessStates = cliProxyProcessStates.filter { currentIDs.contains($0.key) }
+            cliProxyAccountStates = cliProxyAccountStates.filter { currentIDs.contains($0.key) }
+            cliProxyOAuthLogins = cliProxyOAuthLogins.filter { currentIDs.contains($0.key) }
+            cliProxyMessages = cliProxyMessages.filter { currentIDs.contains($0.key) }
+            cliProxyViewState = .loaded
+        } catch {
+            cliProxyViewState = .storageUnavailable
+        }
+    }
+
+    private func refreshCLIProxyStatuses() {
+        guard ensureCLIProxyManager(), let manager = cliProxyManager else { return }
+        guard !cliProxyProfiles.isEmpty else { cliProxyViewState = .loaded; render(.settings); return }
+        let profiles = cliProxyProfiles
+        cliProxyViewState = .loading
+        cliProxyBusyIDs.formUnion(profiles.map(\.id))
+        render(.settings)
+        cliProxyQueue.async { [weak self] in
+            var processStates: [UUID: CLIProxyProcessState] = [:]
+            var accountStates: [UUID: CLIProxyAccountState] = [:]
+            for profile in profiles {
+                let processState = manager.processState(profile: profile)
+                processStates[profile.id] = processState
+                if processState == .running { accountStates[profile.id] = manager.accountState(profile: profile) }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                for profile in profiles {
+                    self.cliProxyProcessStates[profile.id] = processStates[profile.id]
+                    if let account = accountStates[profile.id] { self.cliProxyAccountStates[profile.id] = account }
+                    self.cliProxyBusyIDs.remove(profile.id)
+                }
+                self.cliProxyViewState = .loaded
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
+        }
+    }
+
+    private func performCLIProxyAction(_ profile: CLIProxyProfile,
+                                       operation: @escaping (CLIProxyManager) throws -> Void,
+                                       completion: ((String?) -> Void)? = nil) {
+        guard ensureCLIProxyManager(), let manager = cliProxyManager,
+              !cliProxyBusyIDs.contains(profile.id) else { return }
+        cliProxyBusyIDs.insert(profile.id)
+        cliProxyMessages.removeValue(forKey: profile.id)
+        render(.settings)
+        cliProxyQueue.async { [weak self] in
+            var failure: String?
+            do { try operation(manager) }
+            catch { failure = error.localizedDescription }
+            let processState = manager.processState(profile: profile)
+            let accountState = processState == .running ? manager.accountState(profile: profile) : nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cliProxyProcessStates[profile.id] = processState
+                if let accountState { self.cliProxyAccountStates[profile.id] = accountState }
+                self.cliProxyBusyIDs.remove(profile.id)
+                if let failure { self.cliProxyMessages[profile.id] = failure }
+                self.reloadCLIProxyProfiles()
+                completion?(failure)
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
+        }
+    }
+
+    private func proxyProfile(for sender: NSButton) -> CLIProxyProfile? {
+        guard cliProxyProfiles.indices.contains(sender.tag) else { return nil }
+        return cliProxyProfiles[sender.tag]
+    }
+
+    @objc private func openCLIProxyCatalog() {
+        showingCLIProxyCatalog = true
+        cliProxyViewState = .loaded
+        render(.settings)
+    }
+
+    @objc private func closeCLIProxyCatalog() {
+        showingCLIProxyCatalog = false
+        render(.settings)
+    }
+
+    @objc private func addCLIProxyProfile(_ sender: NSButton) {
+        let provider: CLIProxyProvider
+        switch sender.tag {
+        case 0: provider = .codex
+        case 1: provider = .claude
+        default: return
+        }
+        guard ensureCLIProxyManager(), let manager = cliProxyManager else { return }
+        do {
+            cliProxyProfiles = try manager.store.add(provider: provider)
+            showingCLIProxyCatalog = false
+            cliProxyViewState = .loaded
+            for profile in cliProxyProfiles where cliProxyProcessStates[profile.id] == nil {
+                cliProxyProcessStates[profile.id] = .stopped
+            }
+            render(.settings)
+        } catch {
+            cliProxyViewState = .storageUnavailable
+            render(.settings)
+        }
+    }
+
+    @objc private func prepareCLIProxyProfile(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender) else { return }
+        performCLIProxyAction(profile) { manager in
+            try manager.installEngine()
+            try manager.prepare(profile: profile)
+        }
+    }
+
+    @objc private func activateCLIProxyProfile(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender) else { return }
+        performCLIProxyAction(profile) { try $0.start(profile: profile) }
+    }
+
+    @objc private func stopCLIProxyProfile(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender) else { return }
+        performCLIProxyAction(profile) { try $0.stop(profile: profile) }
+    }
+
+    @objc private func refreshCLIProxyProfile(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender) else { return }
+        performCLIProxyAction(profile) { _ in }
+    }
+
+    @objc private func loginCLIProxyProfile(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender), ensureCLIProxyManager(),
+              let manager = cliProxyManager, !cliProxyBusyIDs.contains(profile.id) else { return }
+        cliProxyBusyIDs.insert(profile.id)
+        cliProxyMessages.removeValue(forKey: profile.id)
+        render(.settings)
+        cliProxyQueue.async { [weak self] in
+            let result: Result<CLIProxyOAuthLogin, Error>
+            do { result = .success(try manager.beginOAuth(profile: profile)) }
+            catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cliProxyBusyIDs.remove(profile.id)
+                switch result {
+                case .success(let login):
+                    self.cliProxyOAuthLogins[profile.id] = login
+                    if !NSWorkspace.shared.open(login.url) {
+                        self.cliProxyMessages[profile.id] = "Não foi possível abrir o navegador. Cancele o login e tente novamente."
+                    }
+                case .failure(let error): self.cliProxyMessages[profile.id] = error.localizedDescription
+                }
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
+        }
+    }
+
+    @objc private func checkCLIProxyOAuth(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender), let login = cliProxyOAuthLogins[profile.id],
+              ensureCLIProxyManager(), let manager = cliProxyManager,
+              !cliProxyBusyIDs.contains(profile.id) else { return }
+        cliProxyBusyIDs.insert(profile.id)
+        cliProxyMessages.removeValue(forKey: profile.id)
+        render(.settings)
+        cliProxyQueue.async { [weak self] in
+            let result: Result<(CLIProxyOAuthState, CLIProxyAccountState?), Error>
+            do {
+                let state = try manager.oauthState(profile: profile, state: login.state)
+                let account = state == .complete ? manager.accountState(profile: profile) : nil
+                result = .success((state, account))
+            } catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cliProxyBusyIDs.remove(profile.id)
+                switch result {
+                case .success((.pending, _)):
+                    self.cliProxyMessages[profile.id] = "O login ainda aguarda a autorização no navegador."
+                case .success((.complete, let account)):
+                    self.cliProxyOAuthLogins.removeValue(forKey: profile.id)
+                    if let account { self.cliProxyAccountStates[profile.id] = account }
+                    self.cliProxyMessages[profile.id] = "Login concluído no armazenamento próprio deste perfil."
+                case .success((.failed, _)):
+                    self.cliProxyOAuthLogins.removeValue(forKey: profile.id)
+                    self.cliProxyMessages[profile.id] = "O login falhou ou expirou. Inicie um novo login para tentar novamente."
+                case .failure(let error): self.cliProxyMessages[profile.id] = error.localizedDescription
+                }
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
+        }
+    }
+
+    @objc private func cancelCLIProxyOAuth(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender), let login = cliProxyOAuthLogins[profile.id] else { return }
+        performCLIProxyAction(profile, operation: { try $0.cancelOAuth(profile: profile, state: login.state) },
+                              completion: { [weak self] failure in
+            if failure == nil { self?.cliProxyOAuthLogins.removeValue(forKey: profile.id) }
+        })
+    }
+
+    @objc private func removeCLIProxyProfile(_ sender: NSButton) {
+        guard let profile = proxyProfile(for: sender), ensureCLIProxyManager(),
+              let manager = cliProxyManager, !cliProxyBusyIDs.contains(profile.id) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remover \(profile.displayName)?"
+        alert.informativeText = "O processo deste perfil será parado e somente os arquivos CLIProxy próprios dele serão apagados. A sessão do provedor não será revogada."
+        alert.addButton(withTitle: "Remover perfil")
+        alert.addButton(withTitle: "Cancelar")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        cliProxyBusyIDs.insert(profile.id)
+        render(.settings)
+        let activeLogin = cliProxyOAuthLogins[profile.id]
+        cliProxyQueue.async { [weak self] in
+            let result: Result<[CLIProxyProfile], Error>
+            do {
+                if let login = activeLogin {
+                    try manager.cancelOAuth(profile: profile, state: login.state)
+                }
+                try manager.removeProfileData(profile: profile)
+                result = .success(try manager.store.remove(id: profile.id))
+            } catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cliProxyBusyIDs.remove(profile.id)
+                switch result {
+                case .success(let profiles):
+                    self.cliProxyProfiles = profiles
+                    self.cliProxyProcessStates.removeValue(forKey: profile.id)
+                    self.cliProxyAccountStates.removeValue(forKey: profile.id)
+                    self.cliProxyOAuthLogins.removeValue(forKey: profile.id)
+                    self.cliProxyMessages.removeValue(forKey: profile.id)
+                case .failure(let error): self.cliProxyMessages[profile.id] = error.localizedDescription
+                }
+                if self.settingsButton.state == .on { self.render(.settings) }
+            }
         }
     }
 
@@ -1606,8 +1977,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func showCLIProxy() {
         selectedSettingsSection = .cliProxy
-        reloadManualRegistrationsForCLIProxy()
-        beginCLIProxyStatusRefresh()
+        showingCLIProxyCatalog = false
+        reloadCLIProxyProfiles()
+        refreshCLIProxyStatuses()
         render(.settings)
     }
     @objc func openWindow() {

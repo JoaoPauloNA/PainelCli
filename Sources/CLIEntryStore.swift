@@ -70,20 +70,6 @@ struct CLIListSnapshot: Equatable {
     let migrationNotice: String?
 }
 
-/// Returns only manual app-owned registrations whose installation and authentication
-/// were both confirmed for that exact UUID. System discoveries never enter this list.
-enum CLIProxyReadiness {
-    static func readyEntries(_ entries: [CLIEntry], installedIDs: Set<UUID>,
-                             authenticationStates: [UUID: CLIAuthenticationUIState]) -> [CLIEntry] {
-        entries.filter { entry in
-            guard entry.origin == .manual,
-                  entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
-                  installedIDs.contains(entry.id) else { return false }
-            return authenticationStates[entry.id] == .authenticated
-        }
-    }
-}
-
 struct CLIEntryStore {
     private let fileManager: FileManager
     let fileURL: URL

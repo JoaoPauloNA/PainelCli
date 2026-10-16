@@ -19,3 +19,7 @@ npm-cache/
 /output/
 /Resources/*
 !/Resources/AppIcon.icns
+!/Resources/CLIProxyAPI-loopback.patch
+/Resources/CLIProxyAPI
+/Resources/CLIProxyAPI.sha256
+/Resources/CLIProxyAPI-LICENSE.txt
