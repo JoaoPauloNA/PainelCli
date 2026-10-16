@@ -486,6 +486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.isBordered = false
                 account.tag = index
                 let isManualEntry = entry.manualEntry != nil
+                let isAntigravityManual = entry.manualEntry?.provider == CLIProvider.antigravity.rawValue
                 let managedRegistration = entry.manualEntry.flatMap {
                     ($0.provider == CLIProvider.codex.rawValue || $0.provider == CLIProvider.claude.rawValue) ? $0 : nil
                 }
@@ -497,9 +498,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let canStartLogin = managedRegistration.map { canStartAuthentication(for: $0) } ?? false
                 let installState = managedRegistration.map { registrationInstallState(for: $0) }
                 let isAuthenticated = authState == .authenticated
-                account.target = self
-                account.action = isAuthenticated ? #selector(logoutCLI(_:)) : #selector(loginCLI(_:))
-                account.isEnabled = !storageLoadFailed &&
+                account.target = managedRegistration == nil ? nil : self
+                account.action = managedRegistration == nil ? nil :
+                    (isAuthenticated ? #selector(logoutCLI(_:)) : #selector(loginCLI(_:)))
+                account.isEnabled = !isAntigravityManual && managedRegistration != nil && !storageLoadFailed &&
                     (managedRegistration.map { !activeRemovalIDs.contains($0.id) } ?? true) &&
                     (canCancelLogin || (installState == .installed && (isAuthenticated || canStartLogin)))
                 account.contentTintColor = account.isEnabled
@@ -514,6 +516,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                             accessibilityDescription: "Sair")
                     account.toolTip = "Sair deste cadastro e limpar as credenciais locais. Isso não revoga a sessão remotamente."
                     account.setAccessibilityLabel("Sair de \(entry.displayName)")
+                } else if isAntigravityManual {
+                    account.toolTip = "Login do Antigravity está fora desta etapa; nenhum status de conta é consultado nem simulado."
+                    account.setAccessibilityLabel("Login indisponível nesta etapa para \(entry.displayName)")
                 } else if case .statusError = authState {
                     account.image = NSImage(systemSymbolName: "exclamationmark.circle",
                                             accessibilityDescription: "Estado do login indeterminado")
@@ -530,7 +535,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         ? "Login indisponível para \(entry.displayName)"
                         : "Entrar pelo navegador em \(entry.displayName)")
                 }
-                account.setAccessibilityValue(authState?.displayText ?? "Login indisponível")
+                account.setAccessibilityValue(isAntigravityManual
+                    ? "Login indisponível nesta etapa"
+                    : (authState?.displayText ?? "Login indisponível"))
                 applyActionAppearance(account)
                 account.translatesAutoresizingMaskIntoConstraints = false
                 actions.addArrangedSubview(account)
@@ -573,7 +580,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let textTrailing = actions.leadingAnchor
                 if let manualEntry = entry.manualEntry,
                    manualEntry.provider == CLIProvider.codex.rawValue ||
-                    manualEntry.provider == CLIProvider.claude.rawValue {
+                    manualEntry.provider == CLIProvider.claude.rawValue ||
+                    manualEntry.provider == CLIProvider.antigravity.rawValue {
                     let install = makeInstallButton(displayName: entry.displayName, tag: index)
                     let state = registrationInstallState(for: manualEntry)
                     let isInstalled = state == .installed
@@ -595,11 +603,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         : canInstall(manualEntry))
                     install.contentTintColor = install.isEnabled
                         ? (isInstalled ? .systemOrange : .controlAccentColor) : .disabledControlTextColor
-                    install.toolTip = isInstalled
-                        ? (manualEntry.provider == CLIProvider.claude.rawValue
-                            ? "Sair deste cadastro e remover o pacote Claude; configurações e histórico ficam para reinstalação."
-                            : "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados.")
-                        : state.displayText
+                    if isInstalled, manualEntry.provider == CLIProvider.claude.rawValue {
+                        install.toolTip = "Sair deste cadastro e remover o pacote Claude; configurações e histórico ficam para reinstalação."
+                    } else if isInstalled, manualEntry.provider == CLIProvider.antigravity.rawValue {
+                        install.toolTip = "Desinstalar somente o binário Antigravity deste UUID; login não é iniciado nesta etapa."
+                    } else {
+                        install.toolTip = isInstalled
+                            ? "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados."
+                            : state.displayText
+                    }
                     install.setAccessibilityLabel(isInstalled
                         ? "Desinstalar \(providerName) gerenciado de \(entry.displayName)"
                         : "Instalar \(providerName) em \(entry.displayName)")
@@ -666,6 +678,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return "Cadastro legado GeminiCLI · encontrada no sistema · \(displayLocation(detection.discoveryURL))"
         }
         let installState = registrationInstallState(for: entry)
+        if entry.provider == CLIProvider.antigravity.rawValue {
+            return installState == .installed
+                ? "Instalada neste UUID · login indisponível nesta etapa"
+                : installState.displayText
+        }
         guard installState == .installed else { return installState.displayText }
         return authenticationUIState(for: entry).displayText
     }
@@ -703,7 +720,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func canInstall(_ entry: CLIEntry) -> Bool {
         guard !storageLoadFailed,
-              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue ||
+                entry.provider == CLIProvider.antigravity.rawValue,
               installService != nil,
               !installingRegistrationIDs.contains(entry.id),
               !activeLogoutIDs.contains(entry.id),
@@ -713,7 +731,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func canUninstall(_ entry: CLIEntry) -> Bool {
         guard !storageLoadFailed,
-              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue ||
+                entry.provider == CLIProvider.antigravity.rawValue,
               !installingRegistrationIDs.contains(entry.id),
               !activeLogoutIDs.contains(entry.id),
               !activeRemovalIDs.contains(entry.id),
@@ -792,13 +811,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               authenticationProcesses[entry.id]?.isRunning != true else { return }
 
         let isManagedRegistration = entry.provider == CLIProvider.codex.rawValue ||
-            entry.provider == CLIProvider.claude.rawValue
+            entry.provider == CLIProvider.claude.rawValue ||
+            entry.provider == CLIProvider.antigravity.rawValue
         guard !isManagedRegistration || installService != nil else { return }
         let service = installService
         let alert = NSAlert()
         alert.messageText = "Remover definitivamente \(entry.displayName)?"
         if entry.provider == CLIProvider.claude.rawValue {
             alert.informativeText = "Esta ação apagará o pacote Claude Code gerenciado, configuração, histórico, caches e credenciais locais deste UUID. Não pode ser desfeita. O logout oficial pode invalidar a credencial no provedor, mas não garante revogar todas as sessões remotas. Instalações globais e outros cadastros não serão alterados."
+        } else if entry.provider == CLIProvider.antigravity.rawValue {
+            alert.informativeText = "Esta ação apagará o binário e todos os dados locais deste cadastro Antigravity UUID. Login não é iniciado, verificado nem removido nesta etapa. Instalações globais, outros UUIDs e perfis pessoais do sistema não serão alterados."
         } else if isManagedRegistration {
             alert.informativeText = "Esta ação apagará o CLI gerenciado deste cadastro, suas configurações, histórico, caches e login local. Não pode ser desfeita. Instalações globais e outros cadastros não serão alterados; não será enviado logout nem revogada uma sessão remota."
         } else {
@@ -862,7 +884,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !storageLoadFailed, let service = installService,
               listItems.indices.contains(sender.tag),
               let entry = listItems[sender.tag].manualEntry,
-              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue,
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue ||
+                entry.provider == CLIProvider.antigravity.rawValue,
               canInstall(entry),
               installingRegistrationIDs.insert(entry.id).inserted else { return }
 
@@ -886,7 +909,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.refreshCLIEntries()
                 if case .success = result {
-                    self.authenticationStates[entry.id] = .notAuthenticated
+                    if entry.provider != CLIProvider.antigravity.rawValue {
+                        self.authenticationStates[entry.id] = .notAuthenticated
+                    }
                     self.refreshAuthenticationStatuses()
                 }
                 self.render(.settings)
@@ -1162,9 +1187,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         let providerName = CLIProvider(rawValue: entry.provider)?.catalogTitle ?? entry.provider
         alert.messageText = "Desinstalar \(providerName) deste cadastro?"
-        alert.informativeText = entry.provider == CLIProvider.claude.rawValue
-            ? "O Claude Code executará o logout oficial neste UUID e confirmará a saída antes de remover o pacote. Configurações, histórico e cache ficam para reinstalação, mas será necessário fazer login novamente. A ação não garante revogação de todas as sessões remotas. Se o logout falhar, o pacote e o cadastro serão mantidos."
-            : "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados."
+        if entry.provider == CLIProvider.claude.rawValue {
+            alert.informativeText = "O Claude Code executará o logout oficial neste UUID e confirmará a saída antes de remover o pacote. Configurações, histórico e cache ficam para reinstalação, mas será necessário fazer login novamente. A ação não garante revogação de todas as sessões remotas. Se o logout falhar, o pacote e o cadastro serão mantidos."
+        } else if entry.provider == CLIProvider.antigravity.rawValue {
+            alert.informativeText = "Somente o binário Antigravity deste UUID será removido. Configuração, cache, dados e temporários exclusivos do cadastro ficam para reinstalação. Nenhum login, logout, navegador ou sessão global será iniciado ou alterado."
+        } else {
+            alert.informativeText = "Somente o pacote gerenciado por este UUID será removido. Configuração, histórico e credenciais locais serão preservados."
+        }
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Desinstalar")
         alert.addButton(withTitle: "Cancelar")
@@ -1182,11 +1211,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch result {
                 case .success:
                     self.installationFailures.removeValue(forKey: entry.id)
-                    self.authenticationStates[entry.id] = entry.provider == CLIProvider.claude.rawValue
-                        ? .notAuthenticated
-                        : .statusError("Credenciais locais preservadas; reinstale para verificar ou sair.")
-                case .failure:
-                    self.showStoreFailure("O pacote deste cadastro não foi removido integralmente. Verifique o estado antes de repetir a ação.")
+                    if entry.provider == CLIProvider.claude.rawValue {
+                        self.authenticationStates[entry.id] = .notAuthenticated
+                    } else {
+                        self.authenticationStates.removeValue(forKey: entry.id)
+                    }
+                case .failure(let error):
+                    self.showStoreFailure("O pacote deste cadastro não foi removido integralmente. \(error.localizedDescription)")
                 }
                 self.refreshCLIEntries()
                 if self.settingsButton.state == .on { self.render(.settings) }

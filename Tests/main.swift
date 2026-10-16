@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() { fatalError(message) }
@@ -10,6 +11,13 @@ func createSyntheticExecutable(_ url: URL, contents: String = "synthetic executa
                                             withIntermediateDirectories: true)
     try Data(contents.utf8).write(to: url)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+}
+
+func syntheticAntigravityManifest(version: String, url: URL, sha512: String) throws -> Data {
+    try JSONSerialization.data(withJSONObject: ["version": version,
+                                                "url": url.absoluteString,
+                                                "sha512": sha512],
+                               options: [.sortedKeys])
 }
 
 func createUnixDomainSocket(at path: String) throws -> Int32 {
@@ -853,28 +861,210 @@ require(ordinalClaudeZero.ordinal == 0 && replacementClaudeZero.ordinal == 0 &&
         claudeService.registrationInstallStatus(for: replacementClaudeZero) == .notInstalled,
         "reusing a Claude ordinal allocates a fresh UUID with no inherited installation")
 
-// Antigravity remains a catalog entry without a registration installer in this scope.
-let unsupportedSupport = testRoot.appendingPathComponent("unsupported-support")
-let unsupportedService = CLIInstallService(applicationSupportDirectory: unsupportedSupport,
-                                           environment: installEnvironment,
-                                           homeDirectory: hostHome,
-                                           additionalSearchDirectories: [],
-                                           knownExecutableOverrides: [:],
-                                           npmExecutableOverride: syntheticNPM,
-                                           nodeExecutableOverride: syntheticNode,
-                                           processRunner: { _, _, _ in fatalError("unsupported providers must not run npm") })
-for provider in [CLIProvider.antigravity] {
-    let unsupportedEntry = CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: 0)
-    require(unsupportedService.registrationInstallStatus(for: unsupportedEntry) == .unsupported,
-            "Antigravity does not display a false installed state")
-    do {
-        _ = try unsupportedService.install(entry: unsupportedEntry)
-        fatalError("unsupported provider installation should be rejected")
-    } catch CLIInstallError.unsupportedProvider {
-    }
+// Antigravity install uses only the current official manifest, checksum, and a fake tar runner.
+let antigravityRoot = testRoot.appendingPathComponent("antigravity-isolation-support")
+let antigravityEntry = try registrationStore.add(provider: .antigravity).last!
+let antigravitySiblingEntry = try registrationStore.add(provider: .antigravity).last!
+let syntheticAntigravityArchive = Data("synthetic Antigravity archive; never executed".utf8)
+let syntheticAntigravityChecksum = SHA512.hash(data: syntheticAntigravityArchive)
+    .map { String(format: "%02x", $0) }.joined()
+let syntheticAntigravityArtifactURL = URL(string:
+    "https://storage.googleapis.com/antigravity-public/antigravity-cli/test/darwin-arm/cli.tar.gz")!
+let syntheticAntigravityManifestData = try syntheticAntigravityManifest(
+    version: "1.4.0", url: syntheticAntigravityArtifactURL, sha512: syntheticAntigravityChecksum)
+var syntheticAntigravityRequests: [URL] = []
+var syntheticAntigravityExtractionStatus: Int32 = 0
+var syntheticAntigravityExtractionCalls = 0
+let syntheticAntigravityService = CLIInstallService(
+    applicationSupportDirectory: antigravityRoot,
+    environment: ["PATH": localBin.path, "HOME": hostHome.path,
+                  "GEMINI_API_KEY": "synthetic-global-key",
+                  "GOOGLE_APPLICATION_CREDENTIALS": hostHome.appendingPathComponent("gcloud.json").path],
+    homeDirectory: hostHome,
+    additionalSearchDirectories: [],
+    knownExecutableOverrides: [:],
+    processRunner: { executable, arguments, environment in
+        require(executable.path == "/usr/bin/tar" &&
+                arguments.count == 5 && arguments[0] == "-xzf" && arguments[2] == "-C" &&
+                arguments[4] == "antigravity" && environment["GEMINI_API_KEY"] == nil &&
+                environment["HOME"]?.contains("/Registrations/") == true,
+                "only the fixed tar extraction runs with a UUID-local environment")
+        syntheticAntigravityExtractionCalls += 1
+        if syntheticAntigravityExtractionStatus == 0 {
+            let destination = URL(fileURLWithPath: arguments[3], isDirectory: true)
+            try createSyntheticExecutable(destination.appendingPathComponent("antigravity"),
+                                          contents: "synthetic CLI; never executed")
+        }
+        return syntheticAntigravityExtractionStatus
+    },
+    httpDataRunner: { url, _ in
+        syntheticAntigravityRequests.append(url)
+        if url.path.hasSuffix("/manifests/darwin_arm64.json") { return syntheticAntigravityManifestData }
+        if url == syntheticAntigravityArtifactURL { return syntheticAntigravityArchive }
+        throw CLIInstallError.antigravityNetworkFailed
+    },
+    processArchitectureOverride: "arm64")
+let globalAgyBefore = try Data(contentsOf: syntheticAntigravity)
+require(syntheticAntigravityService.registrationInstallStatus(for: antigravityEntry) == .notInstalled,
+        "a global agy discovered in PATH cannot mark a manual UUID installed")
+let installedAntigravityURL = try syntheticAntigravityService.install(entry: antigravityEntry)
+let siblingAntigravityURL = try syntheticAntigravityService.install(entry: antigravitySiblingEntry)
+require(installedAntigravityURL != siblingAntigravityURL &&
+        installedAntigravityURL.path.contains(antigravityEntry.id.uuidString) &&
+        siblingAntigravityURL.path.contains(antigravitySiblingEntry.id.uuidString) &&
+        syntheticAntigravityService.registrationInstallStatus(for: antigravityEntry) == .installed &&
+        syntheticAntigravityService.registrationInstallStatus(for: antigravitySiblingEntry) == .installed,
+        "two Antigravity UUIDs receive distinct executables and UUID-bound manifests")
+let antigravityRuntime = try syntheticAntigravityService.isolatedAntigravityRuntimeEnvironment(for: antigravityEntry)
+let globalAgyAfterInstall = try Data(contentsOf: syntheticAntigravity)
+require(antigravityRuntime["HOME"]?.contains(antigravityEntry.id.uuidString) == true &&
+        antigravityRuntime["XDG_CONFIG_HOME"]?.contains(antigravityEntry.id.uuidString) == true &&
+        antigravityRuntime["XDG_CACHE_HOME"]?.contains(antigravityEntry.id.uuidString) == true &&
+        antigravityRuntime["TMPDIR"]?.contains(antigravityEntry.id.uuidString) == true &&
+        antigravityRuntime["GEMINI_API_KEY"] == nil &&
+        antigravityRuntime["GOOGLE_APPLICATION_CREDENTIALS"] == nil &&
+        syntheticAntigravityExtractionCalls == 2 &&
+        syntheticAntigravityRequests.contains(where: { $0.path.hasSuffix("/manifests/darwin_arm64.json") }) &&
+        globalAgyAfterInstall == globalAgyBefore,
+        "Antigravity uses UUID HOME/XDG/TMP, official architecture manifest, and leaves global agy untouched")
+let antigravityRetainedSettings = syntheticAntigravityService.registrationDirectory(for: antigravityEntry)
+    .appendingPathComponent("installation/home/.gemini/antigravity-cli/settings.json")
+try fileManager.createDirectory(at: antigravityRetainedSettings.deletingLastPathComponent(),
+                                withIntermediateDirectories: true)
+try Data("synthetic instance settings".utf8).write(to: antigravityRetainedSettings)
+try syntheticAntigravityService.uninstall(entry: antigravityEntry)
+require(syntheticAntigravityService.registrationInstallStatus(for: antigravityEntry) == .notInstalled &&
+        fileManager.fileExists(atPath: antigravityRetainedSettings.path) &&
+        syntheticAntigravityService.registrationInstallStatus(for: antigravitySiblingEntry) == .installed,
+        "Antigravity uninstall removes one UUID package while preserving its data and sibling")
+_ = try syntheticAntigravityService.install(entry: antigravityEntry)
+require(fileManager.fileExists(atPath: antigravityRetainedSettings.path),
+        "Antigravity reinstall retains UUID-owned settings")
+var antigravityRecordRemoved = false
+try syntheticAntigravityService.removeRegistration(entry: antigravityEntry) {
+    _ = try registrationStore.remove(id: antigravityEntry.id)
+    antigravityRecordRemoved = true
 }
-require(!fileManager.fileExists(atPath: unsupportedSupport.path),
-        "unsupported provider has no installation writes")
+let globalAgyAfterRemoval = try Data(contentsOf: syntheticAntigravity)
+require(antigravityRecordRemoved &&
+        !fileManager.fileExists(atPath: syntheticAntigravityService.registrationDirectory(for: antigravityEntry).path) &&
+        syntheticAntigravityService.registrationInstallStatus(for: antigravitySiblingEntry) == .installed &&
+        globalAgyAfterRemoval == globalAgyBefore,
+        "Antigravity trash removes its UUID tree and row without touching the global binary or sibling")
+try syntheticAntigravityService.removeRegistration(entry: antigravitySiblingEntry) { }
+
+let unsupportedArchitectureEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 99)
+let unsupportedArchitectureService = CLIInstallService(
+    applicationSupportDirectory: testRoot.appendingPathComponent("unsupported-antigravity-architecture"),
+    environment: ["PATH": ""], homeDirectory: hostHome, additionalSearchDirectories: [],
+    knownExecutableOverrides: [:], httpDataRunner: { _, _ in fatalError("unsupported architecture must not download") },
+    processArchitectureOverride: "riscv")
+do {
+    _ = try unsupportedArchitectureService.install(entry: unsupportedArchitectureEntry)
+    fatalError("unsupported Antigravity architecture must fail before network or filesystem operations")
+} catch CLIInstallError.antigravityArchitectureUnsupported {
+}
+require(unsupportedArchitectureService.registrationInstallStatus(for: unsupportedArchitectureEntry) == .notInstalled,
+        "unsupported architecture creates no false install state")
+
+func makeAntigravityFailureService(_ name: String, architecture: String = "arm64",
+                                  manifest: Data = syntheticAntigravityManifestData,
+                                  artifact: Data = syntheticAntigravityArchive,
+                                  failedURL: URL? = nil,
+                                  extractionStatus: @escaping () -> Int32 = { 0 }) -> CLIInstallService {
+    CLIInstallService(
+        applicationSupportDirectory: testRoot.appendingPathComponent(name),
+        environment: ["PATH": "", "HOME": hostHome.path], homeDirectory: hostHome,
+        additionalSearchDirectories: [], knownExecutableOverrides: [:],
+        processRunner: { executable, arguments, _ in
+            guard executable.path == "/usr/bin/tar", arguments.count == 5 else {
+                fatalError("unexpected Antigravity test process")
+            }
+            let status = extractionStatus()
+            if status == 0 {
+                let destination = URL(fileURLWithPath: arguments[3], isDirectory: true)
+                try createSyntheticExecutable(destination.appendingPathComponent("antigravity"))
+            }
+            return status
+        },
+        httpDataRunner: { url, _ in
+            if url == failedURL { throw CLIInstallError.antigravityNetworkFailed }
+            if url.path.contains("/manifests/") { return manifest }
+            if url == syntheticAntigravityArtifactURL { return artifact }
+            throw CLIInstallError.antigravityNetworkFailed
+        },
+        processArchitectureOverride: architecture)
+}
+
+let networkFailureEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+let networkFailureService = makeAntigravityFailureService("antigravity-network-failure",
+                                                          failedURL: URL(string: "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_arm64.json")!)
+do {
+    _ = try networkFailureService.install(entry: networkFailureEntry)
+    fatalError("Antigravity manifest network failure must not publish an install")
+} catch CLIInstallError.antigravityNetworkFailed {
+}
+require(networkFailureService.registrationInstallStatus(for: networkFailureEntry) == .notInstalled,
+        "network failure has no false manifest or package")
+let malformedManifestEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+let malformedManifestService = makeAntigravityFailureService("antigravity-malformed-manifest", manifest: Data("{}".utf8))
+do {
+    _ = try malformedManifestService.install(entry: malformedManifestEntry)
+    fatalError("malformed release manifest must fail closed")
+} catch CLIInstallError.antigravityManifestInvalid {
+}
+let badVersionEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+let badVersionService = makeAntigravityFailureService(
+    "antigravity-bad-version",
+    manifest: try syntheticAntigravityManifest(version: "latest", url: syntheticAntigravityArtifactURL,
+                                               sha512: syntheticAntigravityChecksum))
+do {
+    _ = try badVersionService.install(entry: badVersionEntry)
+    fatalError("unparseable Antigravity version must not be installed")
+} catch CLIInstallError.antigravityVersionUnsupported {
+}
+let badHostEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+let badHostService = makeAntigravityFailureService(
+    "antigravity-unapproved-artifact-host",
+    manifest: try syntheticAntigravityManifest(
+        version: "1.4.0", url: URL(string: "https://attacker.example/antigravity.tar.gz")!,
+        sha512: syntheticAntigravityChecksum))
+do {
+    _ = try badHostService.install(entry: badHostEntry)
+    fatalError("manifest artifact from an unapproved host must be rejected")
+} catch CLIInstallError.antigravityManifestInvalid {
+}
+let checksumEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+let checksumService = makeAntigravityFailureService(
+    "antigravity-checksum-mismatch",
+    manifest: try syntheticAntigravityManifest(version: "1.4.0", url: syntheticAntigravityArtifactURL,
+                                               sha512: String(repeating: "0", count: 128)))
+do {
+    _ = try checksumService.install(entry: checksumEntry)
+    fatalError("checksum mismatch must prevent install publication")
+} catch CLIInstallError.antigravityChecksumMismatch {
+}
+let archiveFailureEntry = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+var retryExtractionStatus: Int32 = 2
+let archiveFailureService = makeAntigravityFailureService(
+    "antigravity-archive-failure", extractionStatus: { retryExtractionStatus })
+do {
+    _ = try archiveFailureService.install(entry: archiveFailureEntry)
+    fatalError("archive extraction failure must not publish an install")
+} catch CLIInstallError.antigravityArchiveInvalid {
+}
+require(archiveFailureService.registrationInstallStatus(for: archiveFailureEntry) == .notInstalled,
+        "failed extraction leaves a retryable, unpublished UUID")
+retryExtractionStatus = 0
+_ = try archiveFailureService.install(entry: archiveFailureEntry)
+require(archiveFailureService.registrationInstallStatus(for: archiveFailureEntry) == .installed,
+        "a failed extraction can be retried successfully for the same UUID")
+try archiveFailureService.uninstall(entry: archiveFailureEntry)
+require([networkFailureService, malformedManifestService, badVersionService, badHostService,
+         checksumService, archiveFailureService].allSatisfy {
+    $0.registrationInstallStatus(for: CLIEntry(id: networkFailureEntry.id,
+                                               provider: CLIProvider.antigravity.rawValue, ordinal: 0)) != .installed
+}, "Antigravity network, manifest, architecture, checksum, and archive errors never report installed")
 
 let missingNPMRoot = testRoot.appendingPathComponent("missing-npm-support")
 let missingNPMService = CLIInstallService(applicationSupportDirectory: missingNPMRoot,

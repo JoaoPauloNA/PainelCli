@@ -1,9 +1,10 @@
 import Foundation
 import Darwin
 import CoreFoundation
+import CryptoKit
 
-/// Providers offered for manual registration. Codex installation is UUID-scoped;
-/// login and the other providers' installers remain unavailable.
+/// Providers offered for manual registration. Installations are UUID-scoped; only
+/// Codex and Claude expose authentication controls in this app version.
 enum CLIProvider: String, CaseIterable, Identifiable {
     case codex = "CodexCLI"
     case claude = "ClaudeCLI"
@@ -103,6 +104,12 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case unsupportedClaudeVersion
     case claudeLogoutFailed(Int32)
     case claudeCleanupReceiptRequired
+    case antigravityArchitectureUnsupported
+    case antigravityNetworkFailed
+    case antigravityManifestInvalid
+    case antigravityChecksumMismatch
+    case antigravityArchiveInvalid
+    case antigravityVersionUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -144,6 +151,18 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "O logout oficial do Claude Code falhou (código \(status)); o pacote e o cadastro foram mantidos."
         case .claudeCleanupReceiptRequired:
             return "O logout oficial deste cadastro não foi comprovado antes da desinstalação. O cadastro e os dados foram mantidos; reinstale o pacote gerenciado e use Desinstalar para limpar a credencial com segurança."
+        case .antigravityArchitectureUnsupported:
+            return "O instalador oficial do Antigravity não publica um build compatível com esta arquitetura."
+        case .antigravityNetworkFailed:
+            return "Não foi possível obter o manifesto ou o pacote oficial do Antigravity; nenhum binário foi instalado."
+        case .antigravityManifestInvalid:
+            return "O manifesto oficial do Antigravity tem campos, versão ou destino inesperados; a instalação foi interrompida."
+        case .antigravityChecksumMismatch:
+            return "O SHA-512 do pacote Antigravity não corresponde ao manifesto oficial; o pacote foi descartado."
+        case .antigravityArchiveInvalid:
+            return "O pacote Antigravity não produziu um binário regular e executável no diretório isolado."
+        case .antigravityVersionUnsupported:
+            return "O manifesto oficial não contém uma versão válida do Antigravity CLI."
         }
     }
 }
@@ -250,6 +269,57 @@ struct CLICommandOutput: Equatable {
 }
 typealias CLICommandOutputRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> CLICommandOutput
 typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String], _ input: Pipe, _ output: Pipe) throws -> Process
+typealias CLIHTTPDataRunner = (_ url: URL, _ timeout: TimeInterval) throws -> Data
+
+private enum CLIHTTPClient {
+    private final class ResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedData: Data?
+        private var storedResponse: URLResponse?
+        private var storedError: Error?
+
+        func store(data: Data?, response: URLResponse?, error: Error?) {
+            lock.lock()
+            storedData = data
+            storedResponse = response
+            storedError = error
+            lock.unlock()
+        }
+
+        func load() -> (Data?, URLResponse?, Error?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (storedData, storedResponse, storedError)
+        }
+    }
+
+    static func fetch(_ url: URL, timeout: TimeInterval) throws -> Data {
+        let resultBox = ResultBox()
+        let finished = DispatchSemaphore(value: 0)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = timeout
+        configuration.timeoutIntervalForResource = timeout
+        let session = URLSession(configuration: configuration)
+        let task = session.dataTask(with: url) { data, result, error in
+            resultBox.store(data: data, response: result, error: error)
+            finished.signal()
+        }
+        task.resume()
+        guard finished.wait(timeout: .now() + timeout + 2) == .success else {
+            task.cancel()
+            session.invalidateAndCancel()
+            throw CLIInstallError.antigravityNetworkFailed
+        }
+        session.finishTasksAndInvalidate()
+        let (responseData, response, requestError) = resultBox.load()
+        guard requestError == nil, let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200, httpResponse.url?.host == url.host,
+              let responseData, responseData.count <= 256 * 1024 * 1024 else {
+            throw CLIInstallError.antigravityNetworkFailed
+        }
+        return responseData
+    }
+}
 
 final class CLIRegistrationOperationLock {
     private let lock = NSLock()
@@ -401,6 +471,12 @@ private enum CLIProcessExecutor {
 }
 
 struct CLIInstallService {
+    private struct AntigravityReleaseManifest: Decodable {
+        let version: String
+        let url: URL
+        let sha512: String
+    }
+
     private struct ClaudeRuntimePaths {
         let root: URL
         init(root: URL) { self.root = root }
@@ -436,6 +512,8 @@ struct CLIInstallService {
     private let outputRunner: CLICommandOutputRunner
     private let authenticationProcessLauncher: CLIAuthenticationProcessLauncher
     private let safariAvailableOverride: Bool?
+    private let httpDataRunner: CLIHTTPDataRunner
+    private let processArchitectureOverride: String?
 
     init(applicationSupportDirectory: URL,
          fileManager: FileManager = .default,
@@ -448,7 +526,9 @@ struct CLIInstallService {
          processRunner: @escaping CLICommandRunner = CLIProcessExecutor.run,
          outputRunner: @escaping CLICommandOutputRunner = CLIProcessExecutor.runCapturingOutput,
          safariAvailableOverride: Bool? = nil,
-         authenticationProcessLauncher: @escaping CLIAuthenticationProcessLauncher = CLIProcessExecutor.start) {
+         authenticationProcessLauncher: @escaping CLIAuthenticationProcessLauncher = CLIProcessExecutor.start,
+         httpDataRunner: @escaping CLIHTTPDataRunner = CLIHTTPClient.fetch,
+         processArchitectureOverride: String? = nil) {
         self.fileManager = fileManager
         self.applicationDirectory = applicationSupportDirectory
             .appendingPathComponent("PainelCli", isDirectory: true)
@@ -462,6 +542,8 @@ struct CLIInstallService {
         self.outputRunner = outputRunner
         self.safariAvailableOverride = safariAvailableOverride
         self.authenticationProcessLauncher = authenticationProcessLauncher
+        self.httpDataRunner = httpDataRunner
+        self.processArchitectureOverride = processArchitectureOverride
     }
 
     static func userService() throws -> CLIInstallService {
@@ -475,7 +557,8 @@ struct CLIInstallService {
     /// Reports only this registration's UUID-scoped installation. A matching executable in
     /// PATH, ChatGPT.app, or another registration never changes this result.
     func registrationInstallStatus(for entry: CLIEntry) -> CLIRegistrationInstallStatus {
-        guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
+        guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue ||
+                entry.provider == CLIProvider.antigravity.rawValue else {
             return .unsupported
         }
         let root = installationRoot(for: entry)
@@ -504,7 +587,7 @@ struct CLIInstallService {
                   let config = try? String(contentsOf: root.appendingPathComponent("codex-home/config.toml"),
                                            encoding: .utf8),
                   config.contains("cli_auth_credentials_store = \"file\"") else { return .incomplete }
-        } else {
+        } else if entry.provider == CLIProvider.claude.rawValue {
             guard manifest.package == "@anthropic-ai/claude-code@latest",
                   manifest.executableRelativePath == Self.claudeExecutableRelativePath,
                   let version = manifest.version,
@@ -515,6 +598,28 @@ struct CLIInstallService {
                   hasPrivatePermissions(root.appendingPathComponent("home", isDirectory: true), allowingOwnerMode: 0o700),
                   claudeExecutableResolvesInsideRegistration(root.appendingPathComponent(manifest.executableRelativePath),
                                                              registrationRoot: root) else { return .incomplete }
+        } else {
+            guard let currentPlatform = antigravityPlatform() else { return .incomplete }
+            guard manifest.package == Self.antigravityManifestPackage,
+                  manifest.executableRelativePath == Self.antigravityExecutableRelativePath,
+                  let version = manifest.version, Self.isSupportedAntigravityVersion(version),
+                  let architecture = manifest.architecture,
+                  architecture == currentPlatform,
+                  let checksum = manifest.integritySHA512, Self.isSHA512(checksum),
+                  isOwnedRealDirectory(root.appendingPathComponent("package/bin", isDirectory: true)),
+                  hasPrivatePermissions(root.appendingPathComponent("package/bin", isDirectory: true), allowingOwnerMode: 0o700),
+                  isOwnedRealDirectory(root.appendingPathComponent("home", isDirectory: true)),
+                  hasPrivatePermissions(root.appendingPathComponent("home", isDirectory: true), allowingOwnerMode: 0o700),
+                  isOwnedRealDirectory(root.appendingPathComponent("xdg/config", isDirectory: true)),
+                  isOwnedRealDirectory(root.appendingPathComponent("xdg/cache", isDirectory: true)),
+                  isOwnedRealDirectory(root.appendingPathComponent("xdg/data", isDirectory: true)),
+                  isOwnedRealDirectory(root.appendingPathComponent("tmp", isDirectory: true)),
+                  hasPrivatePermissions(root.appendingPathComponent("xdg/config", isDirectory: true), allowingOwnerMode: 0o700),
+                  hasPrivatePermissions(root.appendingPathComponent("xdg/cache", isDirectory: true), allowingOwnerMode: 0o700),
+                  hasPrivatePermissions(root.appendingPathComponent("xdg/data", isDirectory: true), allowingOwnerMode: 0o700),
+                  hasPrivatePermissions(root.appendingPathComponent("tmp", isDirectory: true), allowingOwnerMode: 0o700),
+                  antigravityExecutableResolvesInsideRegistration(root.appendingPathComponent(manifest.executableRelativePath),
+                                                                  registrationRoot: root) else { return .incomplete }
         }
         return .installed
     }
@@ -525,6 +630,7 @@ struct CLIInstallService {
     @discardableResult
     func install(entry: CLIEntry) throws -> URL {
         if entry.provider == CLIProvider.claude.rawValue { return try installClaude(entry: entry) }
+        if entry.provider == CLIProvider.antigravity.rawValue { return try installAntigravity(entry: entry) }
         guard entry.provider == CLIProvider.codex.rawValue else { throw CLIInstallError.unsupportedProvider }
         let directory = registrationDirectory(for: entry)
         if fileManager.fileExists(atPath: directory.path) {
@@ -653,7 +759,8 @@ struct CLIInstallService {
     /// Claude logout is completed and verified before removing its package so later trash
     /// can safely delete the UUID config without requiring a reinstall. Codex data is unchanged.
     func uninstall(entry: CLIEntry) throws {
-        guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
+        guard entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue ||
+                entry.provider == CLIProvider.antigravity.rawValue else {
             throw CLIInstallError.unsupportedProvider
         }
         let operationLock = try acquireRegistrationLock(for: entry)
@@ -673,7 +780,8 @@ struct CLIInstallService {
     /// The optional removal closure runs only after the UUID directory is confirmed absent.
     func removeRegistration(entry: CLIEntry, removeRecord: () throws -> Void) throws {
         guard entry.origin == .manual,
-              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue else {
+              entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue ||
+                entry.provider == CLIProvider.antigravity.rawValue else {
             throw CLIInstallError.unsupportedProvider
         }
         let operationLock = try acquireRegistrationLock(for: entry)
@@ -882,6 +990,168 @@ struct CLIInstallService {
                                         npmUserConfig: paths.npmUserConfig,
                                         npmGlobalConfig: paths.npmGlobalConfig,
                                         installationPhase: false)
+    }
+
+    /// Downloads the same architecture-specific release manifest and SHA-512-verified
+    /// artifact used by Google's official installer, then stages only its CLI binary in
+    /// this UUID. It deliberately skips the installer handoff command so installation
+    /// cannot start auth or modify the host shell profile.
+    @discardableResult
+    private func installAntigravity(entry: CLIEntry) throws -> URL {
+        guard let platform = antigravityPlatform() else {
+            throw CLIInstallError.antigravityArchitectureUnsupported
+        }
+        let directory = registrationDirectory(for: entry)
+        if fileManager.fileExists(atPath: directory.path) {
+            guard isSafeRegistrationDirectory(directory), try symlinksStayInside(directory) else {
+                throw CLIInstallError.incompleteInstallation
+            }
+        }
+        switch registrationInstallStatus(for: entry) {
+        case .installed: throw CLIInstallError.alreadyInstalled
+        case .installing: throw CLIInstallError.installationInProgress
+        case .incomplete: throw CLIInstallError.incompleteInstallation
+        case .unsupported: throw CLIInstallError.unsupportedProvider
+        case .notInstalled, .failed: break
+        }
+
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try setPrivatePermissions(directory)
+        let operationLock = try acquireRegistrationLock(for: entry)
+        defer { operationLock.release() }
+        switch registrationInstallStatus(for: entry) {
+        case .installed: throw CLIInstallError.alreadyInstalled
+        case .installing: throw CLIInstallError.installationInProgress
+        case .incomplete: throw CLIInstallError.incompleteInstallation
+        case .unsupported: throw CLIInstallError.unsupportedProvider
+        case .notInstalled, .failed: break
+        }
+
+        let stage = directory.appendingPathComponent(".stage-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: stage, withIntermediateDirectories: false)
+        try setPrivatePermissions(stage)
+        var published = false
+        defer { if !published { try? fileManager.removeItem(at: stage) } }
+
+        let finalRoot = installationRoot(for: entry)
+        let hasRetainedRoot = fileManager.fileExists(atPath: finalRoot.path)
+        if hasRetainedRoot {
+            guard isOwnedRealDirectory(finalRoot),
+                  finalRoot.resolvingSymlinksInPath().standardizedFileURL == finalRoot.standardizedFileURL,
+                  hasPrivatePermissions(finalRoot, allowingOwnerMode: 0o700),
+                  try symlinksStayInside(finalRoot) else {
+                throw CLIInstallError.incompleteInstallation
+            }
+            try copyRetainedRegistrationData(from: finalRoot, to: stage)
+        }
+
+        let packageDirectory = stage.appendingPathComponent("package/bin", isDirectory: true)
+        let home = stage.appendingPathComponent("home", isDirectory: true)
+        let xdg = stage.appendingPathComponent("xdg", isDirectory: true)
+        let temp = stage.appendingPathComponent("tmp", isDirectory: true)
+        let xdgConfig = xdg.appendingPathComponent("config", isDirectory: true)
+        let xdgCache = xdg.appendingPathComponent("cache", isDirectory: true)
+        let xdgData = xdg.appendingPathComponent("data", isDirectory: true)
+        for path in [packageDirectory, home, xdgConfig, xdgCache, xdgData, temp] {
+            try fileManager.createDirectory(at: path, withIntermediateDirectories: true)
+            try setPrivatePermissions(path)
+        }
+
+        let manifestURL = URL(string: Self.antigravityManifestBaseURL + "/manifests/\(platform).json")!
+        let manifestData: Data
+        do { manifestData = try httpDataRunner(manifestURL, 30) }
+        catch { throw CLIInstallError.antigravityNetworkFailed }
+        guard !manifestData.isEmpty, manifestData.count <= 64 * 1024,
+              let release = try? JSONDecoder().decode(AntigravityReleaseManifest.self, from: manifestData) else {
+            throw CLIInstallError.antigravityManifestInvalid
+        }
+        guard Self.isSupportedAntigravityVersion(release.version) else {
+            throw CLIInstallError.antigravityVersionUnsupported
+        }
+        guard Self.isSHA512(release.sha512), Self.isOfficialAntigravityArtifactURL(release.url) else {
+            throw CLIInstallError.antigravityManifestInvalid
+        }
+
+        let artifact: Data
+        do { artifact = try httpDataRunner(release.url, 5 * 60) }
+        catch { throw CLIInstallError.antigravityNetworkFailed }
+        guard !artifact.isEmpty, artifact.count <= 256 * 1024 * 1024 else {
+            throw CLIInstallError.antigravityNetworkFailed
+        }
+        let actualChecksum = SHA512.hash(data: artifact).map { String(format: "%02x", $0) }.joined()
+        guard actualChecksum == release.sha512.lowercased() else {
+            throw CLIInstallError.antigravityChecksumMismatch
+        }
+
+        let binary = stage.appendingPathComponent(Self.antigravityExecutableRelativePath)
+        if release.url.path.hasSuffix(".tar.gz") {
+            let archiveURL = temp.appendingPathComponent("antigravity-cli.tar.gz")
+            try artifact.write(to: archiveURL, options: .atomic)
+            try setPrivatePermissions(archiveURL, mode: 0o600)
+            let extractionDirectory = temp.appendingPathComponent("extract", isDirectory: true)
+            try fileManager.createDirectory(at: extractionDirectory, withIntermediateDirectories: false)
+            try setPrivatePermissions(extractionDirectory)
+            let extractionEnvironment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                                        "HOME": home.path,
+                                        "TMPDIR": temp.path,
+                                        "XDG_CONFIG_HOME": xdgConfig.path,
+                                        "XDG_CACHE_HOME": xdgCache.path,
+                                        "XDG_DATA_HOME": xdgData.path]
+            let extractionStatus = try processRunner(
+                URL(fileURLWithPath: "/usr/bin/tar"),
+                ["-xzf", archiveURL.path, "-C", extractionDirectory.path, "antigravity"],
+                extractionEnvironment)
+            guard extractionStatus == 0 else { throw CLIInstallError.antigravityArchiveInvalid }
+            let extractedBinary = extractionDirectory.appendingPathComponent("antigravity")
+            guard isOwnedRegularFile(extractedBinary), fileManager.isExecutableFile(atPath: extractedBinary.path) else {
+                throw CLIInstallError.antigravityArchiveInvalid
+            }
+            try fileManager.moveItem(at: extractedBinary, to: binary)
+            try fileManager.removeItem(at: archiveURL)
+            try fileManager.removeItem(at: extractionDirectory)
+        } else {
+            try artifact.write(to: binary, options: .atomic)
+        }
+        guard isOwnedRegularFile(binary) else { throw CLIInstallError.antigravityArchiveInvalid }
+        try setPrivatePermissions(binary, mode: 0o700)
+        guard fileManager.isExecutableFile(atPath: binary.path),
+              binary.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(stage.standardizedFileURL.path + "/") else {
+            throw CLIInstallError.antigravityArchiveInvalid
+        }
+
+        let manifest = InstallManifest(registrationID: entry.id, provider: entry.provider,
+                                       package: Self.antigravityManifestPackage,
+                                       executableRelativePath: Self.antigravityExecutableRelativePath,
+                                       version: release.version, integritySHA512: actualChecksum,
+                                       architecture: platform)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let installManifestURL = stage.appendingPathComponent("install.json")
+        try encoder.encode(manifest).write(to: installManifestURL, options: .atomic)
+        try setPrivatePermissions(installManifestURL, mode: 0o600)
+        guard try symlinksStayInside(stage) else { throw CLIInstallError.incompleteInstallation }
+
+        let backupRoot = directory.appendingPathComponent(".uninstalled-\(UUID().uuidString)",
+                                                          isDirectory: true)
+        if hasRetainedRoot { try fileManager.moveItem(at: finalRoot, to: backupRoot) }
+        do {
+            try fileManager.moveItem(at: stage, to: finalRoot)
+        } catch {
+            if hasRetainedRoot, fileManager.fileExists(atPath: backupRoot.path) {
+                try? fileManager.moveItem(at: backupRoot, to: finalRoot)
+            }
+            throw error
+        }
+        guard registrationInstallStatus(for: entry) == .installed else {
+            try? fileManager.removeItem(at: finalRoot)
+            if hasRetainedRoot, fileManager.fileExists(atPath: backupRoot.path) {
+                try? fileManager.moveItem(at: backupRoot, to: finalRoot)
+            }
+            throw CLIInstallError.incompleteInstallation
+        }
+        if hasRetainedRoot { try fileManager.removeItem(at: backupRoot) }
+        published = true
+        return managedExecutableURL(for: entry)
     }
 
     /// Installs the official npm Claude Code package into a UUID-owned prefix. npm/node
@@ -1180,8 +1450,28 @@ struct CLIInstallService {
     }
 
     func managedExecutableURL(for entry: CLIEntry) -> URL {
-        installationRoot(for: entry).appendingPathComponent(entry.provider == CLIProvider.claude.rawValue
-            ? Self.claudeExecutableRelativePath : Self.codexExecutableRelativePath)
+        let relativePath: String
+        switch entry.provider {
+        case CLIProvider.claude.rawValue: relativePath = Self.claudeExecutableRelativePath
+        case CLIProvider.antigravity.rawValue: relativePath = Self.antigravityExecutableRelativePath
+        default: relativePath = Self.codexExecutableRelativePath
+        }
+        return installationRoot(for: entry).appendingPathComponent(relativePath)
+    }
+
+    func isolatedAntigravityRuntimeEnvironment(for entry: CLIEntry) throws -> [String: String] {
+        guard entry.provider == CLIProvider.antigravity.rawValue,
+              registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        let root = installationRoot(for: entry)
+        let temp = root.appendingPathComponent("tmp", isDirectory: true)
+        return ["PATH": Self.systemPathPrefix(with: managedExecutableURL(for: entry).deletingLastPathComponent()),
+                "HOME": root.appendingPathComponent("home", isDirectory: true).path,
+                "XDG_CONFIG_HOME": root.appendingPathComponent("xdg/config", isDirectory: true).path,
+                "XDG_CACHE_HOME": root.appendingPathComponent("xdg/cache", isDirectory: true).path,
+                "XDG_DATA_HOME": root.appendingPathComponent("xdg/data", isDirectory: true).path,
+                "TMPDIR": temp.path, "TMP": temp.path, "TEMP": temp.path]
     }
 
     /// Inspects executable bits and paths only. No discovered CLI is invoked or authenticated.
@@ -1496,6 +1786,10 @@ struct CLIInstallService {
 
     private static let codexExecutableRelativePath = "package/node_modules/.bin/codex"
     private static let claudeExecutableRelativePath = "package/node_modules/.bin/claude"
+    private static let antigravityExecutableRelativePath = "package/bin/agy"
+    private static let antigravityManifestPackage = "google-antigravity-official-cli"
+    private static let antigravityManifestBaseURL = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app"
+    private static let antigravityArtifactPathPrefix = "/antigravity-public/antigravity-cli/"
     private static let safariExecutablePath = "/Applications/Safari.app/Contents/MacOS/Safari"
 
     private struct InstallManifest: Codable {
@@ -1504,15 +1798,74 @@ struct CLIInstallService {
         let package: String
         let executableRelativePath: String
         let version: String?
+        let integritySHA512: String?
+        let architecture: String?
 
         init(registrationID: UUID, provider: String, package: String,
-             executableRelativePath: String, version: String? = nil) {
+             executableRelativePath: String, version: String? = nil,
+             integritySHA512: String? = nil, architecture: String? = nil) {
             self.registrationID = registrationID
             self.provider = provider
             self.package = package
             self.executableRelativePath = executableRelativePath
             self.version = version
+            self.integritySHA512 = integritySHA512
+            self.architecture = architecture
         }
+    }
+
+    private func antigravityPlatform() -> String? {
+        let architecture = processArchitectureOverride ?? Self.currentArchitecture()
+        switch architecture {
+        case "arm64", "aarch64": return "darwin_arm64"
+        case "x86_64", "amd64": return "darwin_amd64"
+        default: return nil
+        }
+    }
+
+    private static func currentArchitecture() -> String {
+        var system = utsname()
+        guard uname(&system) == 0 else { return "unknown" }
+        let machineSize = MemoryLayout.size(ofValue: system.machine)
+        return withUnsafePointer(to: &system.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: machineSize) {
+                String(cString: $0)
+            }
+        }
+    }
+
+    private static func isSupportedAntigravityVersion(_ version: String) -> Bool {
+        let components = version.split(separator: ".")
+        return components.count == 3 && components.allSatisfy { Int($0) != nil }
+    }
+
+    private static func isSHA512(_ value: String) -> Bool {
+        value.count == 128 && value.allSatisfy { $0.isHexDigit }
+    }
+
+    private static func isOfficialAntigravityArtifactURL(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == "https", components.host == "storage.googleapis.com",
+              components.user == nil, components.password == nil,
+              components.path.hasPrefix(antigravityArtifactPathPrefix),
+              components.path.hasSuffix(".tar.gz") || components.path.hasSuffix(".bin") else { return false }
+        return true
+    }
+
+    private static func systemPathPrefix(with packageBin: URL) -> String {
+        ([packageBin.path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+            .joined(separator: ":")
+    }
+
+    private func antigravityExecutableResolvesInsideRegistration(_ executable: URL,
+                                                                  registrationRoot: URL) -> Bool {
+        let root = registrationRoot.standardizedFileURL.resolvingSymlinksInPath().path
+        let resolved = executable.standardizedFileURL.resolvingSymlinksInPath()
+        var info = stat()
+        return resolved.path.hasPrefix(root + "/") &&
+            lstat(resolved.path, &info) == 0 &&
+            (info.st_mode & S_IFMT) == S_IFREG && info.st_uid == getuid() &&
+            fileManager.isExecutableFile(atPath: resolved.path)
     }
 
     private func knownExecutables(for target: CLIDiscoveryTarget) -> [URL] {

@@ -111,6 +111,31 @@ if 'actionSymbol = "shippingbox"' not in row:
 if 'remove.setAccessibilityValue(remove.isEnabled ? "Disponível" : "Inativo")' not in source:
     failures.append("disabled remove control can announce itself as available")
 
+# Antigravity package management is enabled while its shared-keyring auth stays out of scope.
+if "manualEntry.provider == CLIProvider.antigravity.rawValue" not in row:
+    failures.append("Antigravity manual rows do not expose their scoped package action")
+account_start = source.find("let account = NSButton(image:")
+account_end = source.find("applyActionAppearance(account)", account_start)
+account_block = source[account_start:account_end] if account_start >= 0 and account_end > account_start else ""
+if "account.target = managedRegistration == nil ? nil : self" not in account_block or \
+        "account.action = managedRegistration == nil ? nil :" not in account_block or \
+        "!isAntigravityManual && managedRegistration != nil" not in account_block:
+    failures.append("Antigravity account control is not disabled without a login/status target")
+login_start = source.find("@objc private func loginCLI(_ sender: NSButton) {")
+login_end = source.find("@objc private func logoutCLI", login_start)
+login_block = source[login_start:login_end] if login_start >= 0 and login_end > login_start else ""
+if "entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue" not in login_block:
+    failures.append("Antigravity login can reach the authentication handler")
+if "entry.provider != CLIProvider.antigravity.rawValue" not in source:
+    failures.append("Antigravity install success is represented as an authentication state")
+if "if entry.provider == CLIProvider.claude.rawValue {\n            _ = try logoutClaudeWhileLocked" not in uninstall_body or \
+        "if entry.provider == CLIProvider.antigravity.rawValue" in uninstall_body:
+    failures.append("Antigravity uninstall invokes or routes through an authentication operation")
+if "func isolatedAntigravityRuntimeEnvironment" not in installer or \
+        '"HOME": root.appendingPathComponent("home"' not in installer or \
+        '"XDG_CONFIG_HOME": root.appendingPathComponent("xdg/config"' not in installer:
+    failures.append("Antigravity future runtime does not have UUID-owned HOME/XDG paths")
+
 # BUG-PC-INSTALL-PROGRESS-001: loading must follow the existing operation state.
 for expected, message in [
     ("install.isHidden = state == .installing", "busy installation still shows a static action icon"),
@@ -127,4 +152,4 @@ if failures:
         print(f"FAIL: {failure}", file=sys.stderr)
     raise SystemExit(1)
 
-print("Manual install UI contract passed: icons-only scoped install, uninstall, browser login, and verified logout.")
+print("Manual install UI contract passed: scoped Antigravity package actions, disabled Antigravity auth, and verified Codex/Claude flows.")
