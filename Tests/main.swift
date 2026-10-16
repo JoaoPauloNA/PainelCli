@@ -11,6 +11,49 @@ func createSyntheticExecutable(_ url: URL, contents: String = "synthetic executa
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
 }
 
+final class SyntheticNPMRunner {
+    private let lock = NSLock()
+    private let exitCode: Int32
+    private let createsExecutable: Bool
+    private let entered: DispatchSemaphore?
+    private let release: DispatchSemaphore?
+    private var storedInvocations: [(URL, [String], [String: String])] = []
+
+    init(exitCode: Int32 = 0, createsExecutable: Bool = true,
+         entered: DispatchSemaphore? = nil, release: DispatchSemaphore? = nil) {
+        self.exitCode = exitCode
+        self.createsExecutable = createsExecutable
+        self.entered = entered
+        self.release = release
+    }
+
+    var invocations: [(URL, [String], [String: String])] {
+        lock.lock(); defer { lock.unlock() }
+        return storedInvocations
+    }
+
+    func run(executable: URL, arguments: [String], environment: [String: String]) throws -> Int32 {
+        lock.lock()
+        storedInvocations.append((executable, arguments, environment))
+        lock.unlock()
+        if createsExecutable, let prefixIndex = arguments.firstIndex(of: "--prefix"),
+           arguments.indices.contains(prefixIndex + 1) {
+            let prefix = URL(fileURLWithPath: arguments[prefixIndex + 1], isDirectory: true)
+            try createSyntheticExecutable(prefix.appendingPathComponent("node_modules/.bin/codex"))
+        }
+        entered?.signal()
+        if let release { _ = release.wait(timeout: .now() + .seconds(10)) }
+        return exitCode
+    }
+}
+
+final class TestResultBox<Value> {
+    private let lock = NSLock()
+    private var stored: Value?
+    func set(_ value: Value) { lock.lock(); stored = value; lock.unlock() }
+    var value: Value? { lock.lock(); defer { lock.unlock() }; return stored }
+}
+
 func writeStoreDocument(_ store: CLIEntryStore, entries: [CLIEntry],
                         highestOrdinals: [String: Int], hiddenDiscoveries: [String] = [],
                         schemaVersion: Int = 1) throws {
@@ -76,27 +119,6 @@ let codexAfterDeleteAll = try store.add(provider: .codex).last
 require(codexAfterDeleteAll?.ordinal == 0,
         "deleting every provider registration makes ordinal zero available again")
 
-// Registration installs are hard-blocked before any path creation or process operation.
-let isolationRoot = testRoot.appendingPathComponent("isolation-block", isDirectory: true)
-let blockedService = CLIInstallService(applicationSupportDirectory: isolationRoot,
-                                       environment: ["PATH": ""],
-                                       homeDirectory: testRoot,
-                                       additionalSearchDirectories: [],
-                                       knownExecutableOverrides: [:])
-for provider in CLIProvider.allCases {
-    let entry = CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: 1)
-    do {
-        try blockedService.install(entry: entry)
-        fatalError("installation must remain blocked until per-registration isolation exists")
-    } catch CLIInstallError.isolatedInstallationUnavailable {
-    }
-    require(!fileManager.fileExists(atPath: blockedService.installationDirectory(
-        for: CLIDiscoveryTarget(rawValue: provider.rawValue)!).path),
-        "blocked install does not create a shared provider directory")
-}
-require(!fileManager.fileExists(atPath: isolationRoot.path),
-        "blocked install performs no filesystem writes")
-
 // Synthetic executable files prove detection is path-only and preserves true CLI identity.
 let discoveryHome = testRoot.appendingPathComponent("discovery-home", isDirectory: true)
 let localBin = discoveryHome.appendingPathComponent(".local/bin", isDirectory: true)
@@ -132,6 +154,245 @@ require(discoveries.first(where: { $0.target == .claude })?.executableURL == syn
         "symlink discovery preserves executable target and stable alias")
 require(!fileManager.fileExists(atPath: shouldNotRunMarker.path),
         "discovery never executes a synthetic CLI")
+
+// Codex installation tests inject a recorder instead of executing npm or Codex.
+let fakeTools = testRoot.appendingPathComponent("fake-tools", isDirectory: true)
+let syntheticNPM = fakeTools.appendingPathComponent("npm")
+let syntheticNode = fakeTools.appendingPathComponent("node")
+try createSyntheticExecutable(syntheticNPM)
+try createSyntheticExecutable(syntheticNode)
+let hostHome = testRoot.appendingPathComponent("host-home", isDirectory: true)
+let hostCodexHome = hostHome.appendingPathComponent(".codex", isDirectory: true)
+try fileManager.createDirectory(at: hostCodexHome, withIntermediateDirectories: true)
+let hostMarker = hostCodexHome.appendingPathComponent("host-owned-marker")
+try Data("synthetic host data".utf8).write(to: hostMarker)
+let hostMarkerBefore = try Data(contentsOf: hostMarker)
+let installEnvironment = ["PATH": localBin.path,
+                          "HOME": hostHome.path,
+                          "CODEX_HOME": hostCodexHome.path,
+                          "OPENAI_API_KEY": "synthetic-host-api-key",
+                          "NPM_TOKEN": "synthetic-npm-token",
+                          "LANG": "en_US.UTF-8"]
+let successfulNPMRunner = SyntheticNPMRunner()
+let codexInstallService = CLIInstallService(
+    applicationSupportDirectory: testRoot.appendingPathComponent("install-support"),
+    environment: installEnvironment,
+    homeDirectory: hostHome,
+    additionalSearchDirectories: [],
+    knownExecutableOverrides: [.codex: [syntheticCodex]],
+    npmExecutableOverride: syntheticNPM,
+    nodeExecutableOverride: syntheticNode,
+    processRunner: { executable, arguments, environment in
+        try successfulNPMRunner.run(executable: executable, arguments: arguments, environment: environment)
+    })
+
+let registrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("registration-store"))
+let originalRegistration = try registrationStore.add(provider: .codex).last!
+let detectedOriginal = discoveries.first(where: { $0.target == .codex })!
+require(codexInstallService.registrationInstallStatus(for: originalRegistration) == .notInstalled &&
+        detectedOriginal.discoveryURL == syntheticCodex,
+        "a global/original Codex detection does not mark a manual UUID as installed")
+let originalInstallDirectory = codexInstallService.registrationDirectory(for: originalRegistration)
+let originalInstallExecutable = try codexInstallService.install(entry: originalRegistration)
+require(codexInstallService.registrationInstallStatus(for: originalRegistration) == .installed &&
+        fileManager.isExecutableFile(atPath: originalInstallExecutable.path),
+        "the injected Codex package result marks only its registration as installed")
+require(originalInstallDirectory.lastPathComponent == originalRegistration.id.uuidString,
+        "the install directory is keyed by UUID, not the reusable ordinal")
+let firstNPMInvocation = successfulNPMRunner.invocations[0]
+require(firstNPMInvocation.0 == syntheticNPM &&
+        firstNPMInvocation.1.contains("@openai/codex@latest") &&
+        firstNPMInvocation.1.contains("https://registry.npmjs.org"),
+        "installation uses fixed official npm package arguments")
+let npmChildEnvironment = firstNPMInvocation.2
+require(npmChildEnvironment["HOME"] != hostHome.path &&
+        npmChildEnvironment["CODEX_HOME"] != hostCodexHome.path &&
+        npmChildEnvironment["OPENAI_API_KEY"] == nil && npmChildEnvironment["NPM_TOKEN"] == nil &&
+        npmChildEnvironment["NPM_CONFIG_USERCONFIG"] != nil &&
+        npmChildEnvironment["NPM_CONFIG_GLOBALCONFIG"] != nil,
+        "npm receives an instance-local HOME/config and no inherited credential variables")
+let originalCodexConfig = originalInstallDirectory.appendingPathComponent("installation/codex-home/config.toml")
+let originalCodexConfigText = try String(contentsOf: originalCodexConfig, encoding: .utf8)
+require(originalCodexConfigText.contains("cli_auth_credentials_store = \"file\"") &&
+        !fileManager.fileExists(atPath: originalInstallDirectory.appendingPathComponent(
+            "installation/codex-home/auth.json").path),
+        "each Codex home selects file credentials; installation performs no login")
+let isolatedRuntime = try codexInstallService.isolatedRuntimeEnvironment(for: originalRegistration)
+require(isolatedRuntime["CODEX_HOME"] == originalInstallDirectory.appendingPathComponent(
+            "installation/codex-home").path &&
+        isolatedRuntime["HOME"] == originalInstallDirectory.appendingPathComponent("installation/home").path &&
+        isolatedRuntime["OPENAI_API_KEY"] == nil,
+        "future Codex runtime environment is registration-local and excludes inherited API credentials")
+let hostMarkerAfterFirstInstall = try Data(contentsOf: hostMarker)
+let originalCodexAfterFirstInstall = try Data(contentsOf: syntheticCodex)
+require(hostMarkerAfterFirstInstall == hostMarkerBefore &&
+        originalCodexAfterFirstInstall == Data("synthetic executable".utf8),
+        "installation leaves the original Codex executable and host CODEX_HOME untouched")
+
+// Removing a row keeps installations intact; reusing ordinal zero creates a distinct UUID path.
+let secondRegistration = try registrationStore.add(provider: .codex).last!
+require(secondRegistration.ordinal == 1, "the second test registration gets ordinal 1")
+_ = try codexInstallService.install(entry: secondRegistration)
+let secondInstallDirectory = codexInstallService.registrationDirectory(for: secondRegistration)
+_ = try registrationStore.remove(id: secondRegistration.id)
+require(codexInstallService.registrationInstallStatus(for: originalRegistration) == .installed &&
+        fileManager.isExecutableFile(atPath: originalInstallExecutable.path),
+        "removing another manual row does not delete the first registration's install")
+_ = try registrationStore.remove(id: originalRegistration.id)
+let reusedOrdinalRegistration = try registrationStore.add(provider: .codex).last!
+require(reusedOrdinalRegistration.ordinal == 0 && reusedOrdinalRegistration.id != originalRegistration.id,
+        "reusing ordinal zero creates a new registration UUID")
+require(codexInstallService.registrationInstallStatus(for: reusedOrdinalRegistration) == .notInstalled,
+        "the new ordinal-zero row does not inherit the prior UUID's installation")
+let reusedInstallExecutable = try codexInstallService.install(entry: reusedOrdinalRegistration)
+let reusedInstallDirectory = codexInstallService.registrationDirectory(for: reusedOrdinalRegistration)
+let reusedRuntime = try codexInstallService.isolatedRuntimeEnvironment(for: reusedOrdinalRegistration)
+require(originalInstallDirectory != secondInstallDirectory &&
+        originalInstallDirectory != reusedInstallDirectory && secondInstallDirectory != reusedInstallDirectory &&
+        fileManager.isExecutableFile(atPath: originalInstallExecutable.path) &&
+        fileManager.isExecutableFile(atPath: reusedInstallExecutable.path) &&
+        codexInstallService.registrationInstallStatus(for: originalRegistration) == .installed &&
+        codexInstallService.registrationInstallStatus(for: reusedOrdinalRegistration) == .installed &&
+        reusedRuntime["CODEX_HOME"] != isolatedRuntime["CODEX_HOME"] &&
+        reusedRuntime["HOME"] != isolatedRuntime["HOME"] &&
+        reusedRuntime["XDG_CACHE_HOME"] != isolatedRuntime["XDG_CACHE_HOME"],
+        "different UUIDs have separate surviving installations despite ordinal reuse and removal")
+let hostMarkerAfterRepeatedInstalls = try Data(contentsOf: hostMarker)
+let originalCodexAfterRepeatedInstalls = try Data(contentsOf: syntheticCodex)
+require(hostMarkerAfterRepeatedInstalls == hostMarkerBefore &&
+        originalCodexAfterRepeatedInstalls == Data("synthetic executable".utf8),
+        "multiple isolated installs leave global Codex state untouched")
+
+// Providers without an implemented installer remain unavailable and write nothing.
+let unsupportedSupport = testRoot.appendingPathComponent("unsupported-support")
+let unsupportedService = CLIInstallService(applicationSupportDirectory: unsupportedSupport,
+                                           environment: installEnvironment,
+                                           homeDirectory: hostHome,
+                                           additionalSearchDirectories: [],
+                                           knownExecutableOverrides: [:],
+                                           npmExecutableOverride: syntheticNPM,
+                                           nodeExecutableOverride: syntheticNode,
+                                           processRunner: { _, _, _ in fatalError("unsupported providers must not run npm") })
+for provider in [CLIProvider.claude, .antigravity] {
+    let unsupportedEntry = CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: 0)
+    require(unsupportedService.registrationInstallStatus(for: unsupportedEntry) == .unsupported,
+            "Claude and Antigravity do not display a false installed state")
+    do {
+        _ = try unsupportedService.install(entry: unsupportedEntry)
+        fatalError("unsupported provider installation should be rejected")
+    } catch CLIInstallError.unsupportedProvider {
+    }
+}
+require(!fileManager.fileExists(atPath: unsupportedSupport.path),
+        "unsupported provider has no installation writes")
+
+let missingNPMRoot = testRoot.appendingPathComponent("missing-npm-support")
+let missingNPMService = CLIInstallService(applicationSupportDirectory: missingNPMRoot,
+                                         environment: ["PATH": ""],
+                                         homeDirectory: hostHome,
+                                         additionalSearchDirectories: [],
+                                         knownExecutableOverrides: [:])
+let missingNPMEntry = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
+do {
+    _ = try missingNPMService.install(entry: missingNPMEntry)
+    fatalError("missing npm prerequisite must be reported")
+} catch CLIInstallError.npmUnavailable {
+}
+require(!fileManager.fileExists(atPath: missingNPMService.registrationDirectory(for: missingNPMEntry).path),
+        "missing npm is reported before per-registration writes")
+
+let missingNodeRoot = testRoot.appendingPathComponent("missing-node-support")
+let missingNodeService = CLIInstallService(applicationSupportDirectory: missingNodeRoot,
+                                           environment: ["PATH": ""],
+                                           homeDirectory: hostHome,
+                                           additionalSearchDirectories: [],
+                                           knownExecutableOverrides: [:],
+                                           npmExecutableOverride: syntheticNPM)
+let missingNodeEntry = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
+do {
+    _ = try missingNodeService.install(entry: missingNodeEntry)
+    fatalError("missing Node.js prerequisite must be reported")
+} catch CLIInstallError.nodeUnavailable {
+}
+require(!fileManager.fileExists(atPath: missingNodeService.registrationDirectory(for: missingNodeEntry).path),
+        "missing Node.js is reported before per-registration writes")
+
+// Nonzero or incomplete npm results leave no published install and can be retried honestly.
+let failureRoot = testRoot.appendingPathComponent("failed-install-support")
+let failureRunner = SyntheticNPMRunner(exitCode: 7)
+let failureService = CLIInstallService(applicationSupportDirectory: failureRoot,
+                                       environment: installEnvironment,
+                                       homeDirectory: hostHome,
+                                       additionalSearchDirectories: [],
+                                       knownExecutableOverrides: [:],
+                                       npmExecutableOverride: syntheticNPM,
+                                       nodeExecutableOverride: syntheticNode,
+                                       processRunner: { executable, arguments, environment in
+    try failureRunner.run(executable: executable, arguments: arguments, environment: environment)
+})
+let failedEntry = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
+do {
+    _ = try failureService.install(entry: failedEntry)
+    fatalError("failed npm invocation must not publish an installation")
+} catch CLIInstallError.commandFailed(7) {
+}
+require(failureService.registrationInstallStatus(for: failedEntry) == .notInstalled &&
+        !fileManager.fileExists(atPath: failureService.managedExecutableURL(for: failedEntry).path),
+        "a partial npm output after failure is removed and never reported as installed")
+let incompleteRunner = SyntheticNPMRunner(createsExecutable: false)
+let incompleteService = CLIInstallService(applicationSupportDirectory: testRoot.appendingPathComponent("incomplete-install-support"),
+                                          environment: installEnvironment,
+                                          homeDirectory: hostHome,
+                                          additionalSearchDirectories: [],
+                                          knownExecutableOverrides: [:],
+                                          npmExecutableOverride: syntheticNPM,
+                                          nodeExecutableOverride: syntheticNode,
+                                          processRunner: { executable, arguments, environment in
+    try incompleteRunner.run(executable: executable, arguments: arguments, environment: environment)
+})
+let incompleteEntry = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
+do {
+    _ = try incompleteService.install(entry: incompleteEntry)
+    fatalError("npm success without the executable must not publish an installation")
+} catch CLIInstallError.incompleteInstallation {
+}
+require(incompleteService.registrationInstallStatus(for: incompleteEntry) == .notInstalled,
+        "npm exit zero without a Codex executable is not a successful install")
+
+// A per-UUID OS file lock prevents concurrent duplicate npm commands.
+let installEntered = DispatchSemaphore(value: 0)
+let releaseInstall = DispatchSemaphore(value: 0)
+let concurrentRunner = SyntheticNPMRunner(entered: installEntered, release: releaseInstall)
+let concurrentService = CLIInstallService(applicationSupportDirectory: testRoot.appendingPathComponent("concurrent-support"),
+                                          environment: installEnvironment,
+                                          homeDirectory: hostHome,
+                                          additionalSearchDirectories: [],
+                                          knownExecutableOverrides: [:],
+                                          npmExecutableOverride: syntheticNPM,
+                                          nodeExecutableOverride: syntheticNode,
+                                          processRunner: { executable, arguments, environment in
+    try concurrentRunner.run(executable: executable, arguments: arguments, environment: environment)
+})
+let concurrentEntry = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
+let concurrentResult = TestResultBox<Bool>()
+let completed = DispatchGroup()
+completed.enter()
+DispatchQueue.global(qos: .userInitiated).async {
+    do { _ = try concurrentService.install(entry: concurrentEntry); concurrentResult.set(true) }
+    catch { concurrentResult.set(false) }
+    completed.leave()
+}
+require(installEntered.wait(timeout: .now() + .seconds(5)) == .success,
+        "the first isolated npm install reached the injected runner")
+do {
+    _ = try concurrentService.install(entry: concurrentEntry)
+    fatalError("a second same-UUID install must be rejected while the first is active")
+} catch CLIInstallError.installationInProgress {
+}
+releaseInstall.signal()
+require(completed.wait(timeout: .now() + .seconds(5)) == .success && concurrentResult.value == true &&
+        concurrentRunner.invocations.count == 1,
+        "same-UUID concurrent clicks result in exactly one npm invocation")
 
 let detectedOnlyStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("detected-only"))
 _ = try detectedOnlyStore.snapshot(discoveries: discoveries)
@@ -286,4 +547,4 @@ do {
             "failed migration preserves the original file")
 }
 
-print("CLI catalog migration, discovery, and isolation-block tests passed")
+print("CLI catalog migration, discovery, and isolated Codex installer tests passed")

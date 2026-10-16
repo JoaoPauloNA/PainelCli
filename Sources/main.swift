@@ -82,6 +82,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var detections: [CLIDiscovery] = []
     private var automaticInstallations: [CLIAutomaticInstallation] = []
     private var migrationNotice: String?
+    private var installingRegistrationIDs = Set<UUID>()
+    private var installationFailures: [UUID: String] = [:]
     private var listItems: [CLIListItem] {
         automaticInstallations.map(CLIListItem.detected) + entries.map(CLIListItem.manual)
     }
@@ -382,6 +384,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let appearance = detectedAppearance(for: installation.target)
                     icon.image = appearance.0
                     icon.contentTintColor = appearance.1
+                } else if let target = CLIDiscoveryTarget(rawValue: entry.provider) {
+                    let appearance = detectedAppearance(for: target)
+                    icon.image = appearance.0
+                    icon.contentTintColor = appearance.1
                 } else {
                     icon.image = cliSymbol()
                     icon.contentTintColor = .secondaryLabelColor
@@ -397,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     originDescription = installation.isManaged ? "CLI instalada pelo PainelCli" : "CLI encontrada na máquina"
                 case .manual:
                     originSymbol = "app"
-                    originDescription = "Cadastro do app · não indica instalação pelo PainelCli"
+                    originDescription = "Cadastro manual no PainelCli"
                 }
                 origin.image = NSImage(systemSymbolName: originSymbol, accessibilityDescription: originDescription)
                 origin.imageScaling = .scaleProportionallyUpOrDown
@@ -407,9 +413,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let name = label(entry.displayName, size: 13, weight: .medium)
                 let statusText = listStatus(for: entry)
                 let compactStatus: String
-                if statusText.hasPrefix("Encontrada") {
+                if entry.manualEntry == nil && statusText.hasPrefix("Encontrada") {
                     compactStatus = "Encontrada no sistema"
-                } else if statusText.hasPrefix("Instalada") {
+                } else if entry.manualEntry == nil && statusText.hasPrefix("Instalada") {
                     compactStatus = "Instalada pelo PainelCli"
                 } else {
                     compactStatus = statusText
@@ -455,7 +461,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 remove.bezelStyle = .inline
                 remove.isBordered = false
                 remove.tag = index
-                remove.isEnabled = isManualEntry && !storageLoadFailed
+                remove.isEnabled = isManualEntry && !storageLoadFailed &&
+                    entry.manualEntry.map { !installingRegistrationIDs.contains($0.id) } == true
                 remove.contentTintColor = remove.isEnabled ? .systemRed : .disabledControlTextColor
                 remove.toolTip = isManualEntry
                     ? "Remover \(entry.displayName) da lista"
@@ -474,13 +481,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     row.addSubview($0)
                 }
                 let textTrailing = actions.leadingAnchor
-                if isManualEntry {
+                if let manualEntry = entry.manualEntry,
+                   manualEntry.provider == CLIProvider.codex.rawValue {
                     let install = makeInstallButton(displayName: entry.displayName, tag: index)
-                    install.isEnabled = false
-                    install.contentTintColor = .disabledControlTextColor
-                    install.toolTip = "Instalação indisponível até haver diretório isolado por cadastro"
-                    install.setAccessibilityLabel("Instalar \(entry.displayName), indisponível até haver isolamento por cadastro")
-                    install.setAccessibilityValue("Isolamento por cadastro não disponível")
+                    let state = registrationInstallState(for: manualEntry)
+                    install.target = self
+                    install.action = #selector(installCLI(_:))
+                    install.isEnabled = canInstall(manualEntry)
+                    install.contentTintColor = install.isEnabled ? .controlAccentColor : .disabledControlTextColor
+                    install.toolTip = state.displayText
+                    install.setAccessibilityLabel("Instalar \(entry.displayName)")
+                    install.setAccessibilityValue(state.displayText)
                     install.translatesAutoresizingMaskIntoConstraints = false
                     actions.insertArrangedSubview(install, at: 0)
                     install.widthAnchor.constraint(greaterThanOrEqualToConstant: 92).isActive = true
@@ -537,12 +548,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return "Cadastro legado GeminiCLI · encontrada no sistema · \(displayLocation(detection.discoveryURL))"
         }
-        guard let provider = CLIProvider(rawValue: entry.provider) else { return entry.statusText }
-        if let detection = detections.first(where: { $0.target.rawValue == provider.rawValue }) {
-            let status = detection.isManaged ? "Instalada pelo PainelCli · registro manual" : "Encontrada no sistema · registro manual"
-            return "\(status) · \(displayLocation(detection.discoveryURL))"
-        }
-        return "Cadastro salvo · instalação isolada ainda indisponível"
+        return registrationInstallState(for: entry).displayText
+    }
+
+    private func registrationInstallState(for entry: CLIEntry) -> CLIRegistrationInstallStatus {
+        if installingRegistrationIDs.contains(entry.id) { return .installing }
+        if let message = installationFailures[entry.id] { return .failed(message) }
+        return installService?.registrationInstallStatus(for: entry) ?? .unsupported
+    }
+
+    private func canInstall(_ entry: CLIEntry) -> Bool {
+        guard !storageLoadFailed,
+              entry.provider == CLIProvider.codex.rawValue,
+              installService != nil,
+              !installingRegistrationIDs.contains(entry.id) else { return false }
+        return registrationInstallState(for: entry).canInstall
     }
 
     private func displayLocation(_ executable: URL) -> String {
@@ -569,7 +589,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func removeCLI(_ sender: NSButton) {
         guard !storageLoadFailed, let entryStore, listItems.indices.contains(sender.tag),
-              let entry = listItems[sender.tag].manualEntry else { return }
+              let entry = listItems[sender.tag].manualEntry,
+              !installingRegistrationIDs.contains(entry.id) else { return }
         let id = entry.id
         do {
             entries = try entryStore.remove(id: id)
@@ -577,6 +598,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             render(.settings)
         } catch {
             showStoreFailure("Não foi possível remover o registro. Os dados existentes foram preservados.")
+        }
+    }
+
+    @objc private func installCLI(_ sender: NSButton) {
+        guard !storageLoadFailed, let service = installService,
+              listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry,
+              entry.provider == CLIProvider.codex.rawValue,
+              canInstall(entry),
+              installingRegistrationIDs.insert(entry.id).inserted else { return }
+
+        installationFailures.removeValue(forKey: entry.id)
+        render(.settings)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result: Result<URL, Error>
+            do { result = .success(try service.install(entry: entry)) }
+            catch { result = .failure(error) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.installingRegistrationIDs.remove(entry.id)
+                if case .failure(let error) = result {
+                    if let installError = error as? CLIInstallError {
+                        self.installationFailures[entry.id] = installError.errorDescription ??
+                            "A instalação não foi concluída."
+                    } else {
+                        self.installationFailures[entry.id] =
+                            "Erro local ao preparar a instalação; nenhuma credencial foi usada."
+                    }
+                }
+                self.refreshCLIEntries()
+                self.render(.settings)
+            }
         }
     }
 

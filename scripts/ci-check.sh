@@ -19,4 +19,6 @@ xcrun swiftc \
   -o "$temp_dir/PainelCliTests"
 
 "$temp_dir/PainelCliTests"
-echo "AppKit compile and isolated tests passed. No CLI installation was run."
+python3 "$repo_root/Tests/manual_install_ui_contract.py"
+python3 "$repo_root/Tests/cli_icon_contract.py"
+echo "AppKit compile, isolated installer tests, UI contracts, and icon contract passed. No real CLI or npm command was run."
