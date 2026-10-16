@@ -49,6 +49,25 @@ private func navigationMaterial() -> NSVisualEffectView {
     return view
 }
 
+private enum CLIListItem {
+    case detected(CLIAutomaticInstallation)
+    case manual(CLIEntry)
+
+    var id: UUID {
+        switch self { case .detected(let item): return item.id; case .manual(let item): return item.id }
+    }
+    var displayName: String {
+        switch self { case .detected(let item): return item.displayName; case .manual(let item): return item.displayName }
+    }
+    var provider: String {
+        switch self { case .detected(let item): return item.target.rawValue; case .manual(let item): return item.provider }
+    }
+    var manualEntry: CLIEntry? {
+        if case .manual(let entry) = self { return entry }
+        return nil
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var statusItem: NSStatusItem!
@@ -60,7 +79,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var entryStore: CLIEntryStore?
     private var installService: CLIInstallService?
     private var entries: [CLIEntry] = []
-    private var detections: [CLIDetection] = []
+    private var detections: [CLIDiscovery] = []
+    private var automaticInstallations: [CLIAutomaticInstallation] = []
+    private var listItems: [CLIListItem] {
+        automaticInstallations.map(CLIListItem.detected) + entries.map(CLIListItem.manual)
+    }
     private var storageLoadFailed = false
     private var installingProviders = Set<String>()
     private var installMessages: [String: String] = [:]
@@ -284,7 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.bottomAnchor.constraint(equalTo: document.bottomAnchor)
         ])
 
-        if storageLoadFailed || entries.isEmpty {
+        if storageLoadFailed || listItems.isEmpty {
             let message = storageLoadFailed
                 ? "Não foi possível carregar os registros salvos. O arquivo foi preservado e novos registros estão indisponíveis."
                 : "Nenhuma CLI adicionada. Use + para escolher no catálogo."
@@ -294,7 +317,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stack.addArrangedSubview(notice)
             notice.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         } else {
-            for (index, entry) in entries.enumerated() {
+            for (index, entry) in listItems.enumerated() {
+                if index == 0 || (index == automaticInstallations.count && !entries.isEmpty) {
+                    let section = NSView()
+                    section.translatesAutoresizingMaskIntoConstraints = false
+                    let sectionName = label(entry.manualEntry == nil ? "Instalações detectadas" : "Cadastros manuais",
+                                            size: 11, weight: .semibold, color: .secondaryLabelColor)
+                    section.addSubview(sectionName)
+                    NSLayoutConstraint.activate([
+                        section.heightAnchor.constraint(equalToConstant: 32),
+                        sectionName.leadingAnchor.constraint(equalTo: section.leadingAnchor, constant: 4),
+                        sectionName.centerYAnchor.constraint(equalTo: section.centerYAnchor)
+                    ])
+                    stack.addArrangedSubview(section)
+                    section.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+                }
                 let row = NSView()
                 row.translatesAutoresizingMaskIntoConstraints = false
                 row.heightAnchor.constraint(equalToConstant: 56).isActive = true
@@ -304,7 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 icon.contentTintColor = .secondaryLabelColor
                 icon.setAccessibilityElement(false)
                 let name = label(entry.displayName, size: 13, weight: .medium)
-                let statusText = entryStatus(for: entry)
+                let statusText = listStatus(for: entry)
                 let compactStatus: String
                 if statusText.hasPrefix("Encontrada") {
                     compactStatus = entry.provider == "GeminiCLI" ? "Encontrada · contas individuais indisponíveis" : "Encontrada no sistema"
@@ -323,15 +360,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 name.lineBreakMode = .byTruncatingTail
                 name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-                let actions = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
-                                       target: self, action: #selector(removeCLI(_:)))
-                actions.bezelStyle = .inline
-                actions.isBordered = false
-                actions.contentTintColor = .systemRed
-                actions.tag = index
-                actions.isEnabled = !storageLoadFailed
-                actions.toolTip = "Remover \(entry.displayName) da lista"
-                actions.setAccessibilityLabel("Remover \(entry.displayName) da lista")
+                let actions = NSStackView()
+                actions.orientation = .horizontal
+                actions.alignment = .centerY
+                actions.spacing = 8
+                actions.translatesAutoresizingMaskIntoConstraints = false
 
                 let simulatedLoggedIn = simulatedSessions.contains(entry.id)
                 let account = NSButton(image: NSImage(systemSymbolName: simulatedLoggedIn ? "power" : "person.crop.circle",
@@ -345,14 +378,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.toolTip = "\(demoAction) · simulação visual, sem autenticação real"
                 account.setAccessibilityLabel("\(demoAction) de \(entry.displayName), simulação visual")
                 account.setAccessibilityValue(simulatedLoggedIn ? "Logado em simulação" : "Deslogado em simulação")
+                account.translatesAutoresizingMaskIntoConstraints = false
+                actions.addArrangedSubview(account)
+                account.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                account.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
-                let installing = installingProviders.contains(entry.provider)
-                let canInstall = !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
-                [icon, name, status, account, actions].forEach {
+                // Automatic discoveries have no delete/hide control or deletion target.
+                if entry.manualEntry != nil {
+                    let remove = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
+                                          target: self, action: #selector(removeCLI(_:)))
+                    remove.bezelStyle = .inline
+                    remove.isBordered = false
+                    remove.contentTintColor = .systemRed
+                    remove.tag = index
+                    remove.isEnabled = !storageLoadFailed
+                    remove.toolTip = "Remover \(entry.displayName) da lista"
+                    remove.setAccessibilityLabel("Remover \(entry.displayName) da lista")
+                    remove.translatesAutoresizingMaskIntoConstraints = false
+                    actions.addArrangedSubview(remove)
+                    remove.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                    remove.heightAnchor.constraint(equalToConstant: 28).isActive = true
+                }
+
+                let installing = entry.manualEntry != nil && installingProviders.contains(entry.provider)
+                let canInstall = entry.manualEntry != nil && !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
+                [icon, name, status, actions].forEach {
                     $0.translatesAutoresizingMaskIntoConstraints = false
                     row.addSubview($0)
                 }
-                var textTrailing = account.leadingAnchor
+                let textTrailing = actions.leadingAnchor
                 if canInstall {
                     let install = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)!,
                                            target: self, action: #selector(installCLI(_:)))
@@ -362,14 +416,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     install.toolTip = "Instalar \(entry.provider)"
                     install.setAccessibilityLabel("Instalar \(entry.provider)")
                     install.translatesAutoresizingMaskIntoConstraints = false
-                    row.addSubview(install)
-                    NSLayoutConstraint.activate([
-                        install.trailingAnchor.constraint(equalTo: account.leadingAnchor, constant: -6),
-                        install.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                        install.widthAnchor.constraint(equalToConstant: 28),
-                        install.heightAnchor.constraint(equalToConstant: 28)
-                    ])
-                    textTrailing = install.leadingAnchor
+                    actions.insertArrangedSubview(install, at: 0)
+                    install.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                    install.heightAnchor.constraint(equalToConstant: 28).isActive = true
                 } else if installing {
                     let progress = NSProgressIndicator()
                     progress.style = .spinning
@@ -377,15 +426,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     progress.isIndeterminate = true
                     progress.setAccessibilityLabel("Instalação em andamento")
                     progress.translatesAutoresizingMaskIntoConstraints = false
-                    row.addSubview(progress)
-                    NSLayoutConstraint.activate([
-                        progress.trailingAnchor.constraint(equalTo: account.leadingAnchor, constant: -10),
-                        progress.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                        progress.widthAnchor.constraint(equalToConstant: 16),
-                        progress.heightAnchor.constraint(equalToConstant: 16)
-                    ])
+                    actions.insertArrangedSubview(progress, at: 0)
+                    progress.widthAnchor.constraint(equalToConstant: 16).isActive = true
+                    progress.heightAnchor.constraint(equalToConstant: 16).isActive = true
                     progress.startAnimation(nil)
-                    textTrailing = progress.leadingAnchor
                 }
                 let separator = NSBox()
                 separator.boxType = .separator
@@ -402,14 +446,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     status.leadingAnchor.constraint(equalTo: name.leadingAnchor),
                     status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 3),
                     status.trailingAnchor.constraint(equalTo: textTrailing, constant: -12),
-                    account.trailingAnchor.constraint(equalTo: actions.leadingAnchor, constant: -8),
-                    account.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                    account.widthAnchor.constraint(equalToConstant: 28),
-                    account.heightAnchor.constraint(equalToConstant: 28),
                     actions.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -2),
                     actions.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                    actions.widthAnchor.constraint(equalToConstant: 30),
-                    actions.heightAnchor.constraint(equalToConstant: 28),
                     separator.leadingAnchor.constraint(equalTo: name.leadingAnchor),
                     separator.trailingAnchor.constraint(equalTo: row.trailingAnchor),
                     separator.bottomAnchor.constraint(equalTo: row.bottomAnchor),
@@ -421,6 +459,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func listStatus(for item: CLIListItem) -> String {
+        switch item {
+        case .manual(let entry): return entryStatus(for: entry)
+        case .detected(let installation):
+            let status = installation.isManaged ? "Instalada pelo PainelCli" : "Encontrada no sistema"
+            let note = installation.target == .gemini ? " · contas individuais não atendidas" : ""
+            return "\(status) · \(displayLocation(installation.discoveryURL))\(note)"
+        }
+    }
+
     private func entryStatus(for entry: CLIEntry) -> String {
         if let message = installMessages[entry.provider] {
             if entry.provider == CLIProvider.gemini.rawValue && !message.contains("contas individuais") {
@@ -428,27 +476,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return message
         }
-        guard let provider = CLIProvider(rawValue: entry.provider) else {
-            return entry.statusText
+        guard let provider = CLIProvider(rawValue: entry.provider) else { return entry.statusText }
+        if let detection = detections.first(where: { $0.target.rawValue == provider.rawValue }) {
+            let status = detection.isManaged ? "Instalada pelo PainelCli · registro manual" : "Encontrada no sistema · registro manual"
+            let note = provider == .gemini ? " · contas individuais não atendidas" : ""
+            return "\(status) · \(displayLocation(detection.discoveryURL))\(note)"
         }
-        let providerDetections = detections.filter { $0.provider == provider }
-        let detection = entry.origin == .automatic
-            ? providerDetections.first(where: { $0.discoveryURL.path == entry.detectedPath })
-            : providerDetections.first
-        if let detection {
-            let status: String
-            if detection.isManaged {
-                status = entry.origin == .automatic
-                    ? "Instalada pelo PainelCli · detectada automaticamente"
-                    : "Instalada pelo PainelCli · registro manual"
-            } else if entry.origin == .automatic {
-                status = "Encontrada automaticamente · \(displayLocation(detection.discoveryURL))"
-            } else {
-                status = "Encontrada no sistema · registro manual · \(displayLocation(detection.discoveryURL))"
-            }
-            return provider == .gemini ? "\(status) · contas individuais não atendidas" : status
-        }
-        if entry.origin == .automatic { return "Detecção automática desatualizada" }
         if provider == .gemini { return "Registrada · serviço indisponível para contas individuais" }
         return "Registrada · CLI ainda não instalada"
     }
@@ -464,18 +497,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshCLIEntries() {
         guard !storageLoadFailed, let entryStore, let installService else { return }
-        detections = installService.detectedExecutables()
+        detections = installService.detectedInstallations()
         do {
-            entries = try entryStore.reconcile(discoveries: detections)
-            simulatedSessions.formIntersection(Set(entries.map(\.id)))
+            let snapshot = try entryStore.snapshot(discoveries: detections)
+            entries = snapshot.manualRegistrations
+            automaticInstallations = snapshot.detectedInstallations
+            simulatedSessions.formIntersection(Set(listItems.map(\.id)))
         } catch {
             storageLoadFailed = true
         }
     }
 
     @objc private func toggleSimulatedSession(_ sender: NSButton) {
-        guard entries.indices.contains(sender.tag) else { return }
-        let id = entries[sender.tag].id
+        guard listItems.indices.contains(sender.tag) else { return }
+        let id = listItems[sender.tag].id
         if !simulatedSessions.insert(id).inserted {
             simulatedSessions.remove(id)
         }
@@ -483,13 +518,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func removeCLI(_ sender: NSButton) {
-        guard !storageLoadFailed, let entryStore, entries.indices.contains(sender.tag) else { return }
-        let entry = entries[sender.tag]
+        guard !storageLoadFailed, let entryStore, listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry else { return }
         let id = entry.id
-        let paths = detections.filter { $0.provider.rawValue == entry.provider }
-            .map { $0.discoveryURL.path }
         do {
-            entries = try entryStore.remove(id: id, suppressingDiscoveryPaths: paths)
+            entries = try entryStore.remove(id: id)
             simulatedSessions.remove(id)
             refreshCLIEntries()
             render(.settings)
@@ -499,8 +532,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func installCLI(_ sender: NSButton) {
-        guard !storageLoadFailed, entries.indices.contains(sender.tag), let installService else { return }
-        let providerName = entries[sender.tag].provider
+        guard !storageLoadFailed, listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry, let installService else { return }
+        let providerName = entry.provider
         guard let provider = CLIProvider(rawValue: providerName), installingProviders.insert(providerName).inserted else { return }
         installMessages[providerName] = "Instalação iniciada pelo usuário…"
         render(.settings)
