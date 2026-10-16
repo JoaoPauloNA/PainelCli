@@ -6,7 +6,8 @@ import sys
 
 source = (Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text(encoding="utf-8")
 failures: list[str] = []
-icon_start = source.find("let icon = NSImageView()")
+entry_list_start = source.find("private func renderEntryList(in body: NSView)")
+icon_start = source.find("let icon = NSImageView()", entry_list_start)
 icon_end = source.find("icon.imageScaling =", icon_start)
 icon_block = source[icon_start:icon_end] if icon_start >= 0 and icon_end > icon_start else ""
 

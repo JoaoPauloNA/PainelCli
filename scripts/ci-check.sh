@@ -21,4 +21,5 @@ xcrun swiftc \
 "$temp_dir/PainelCliTests"
 python3 "$repo_root/Tests/manual_install_ui_contract.py"
 python3 "$repo_root/Tests/cli_icon_contract.py"
-echo "AppKit compile, isolated installer tests, UI contracts, and icon contract passed. No real CLI or npm command was run."
+python3 "$repo_root/Tests/cliproxy_contract.py"
+echo "AppKit compile, isolated installer tests, UI contracts, icon contract, and CLIProxy contract passed. No real CLI or npm command was run."

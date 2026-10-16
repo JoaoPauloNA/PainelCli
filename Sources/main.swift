@@ -2,6 +2,7 @@ import AppKit
 
 private enum Screen { case home, settings }
 private enum SettingsSection { case add, cliProxy }
+private enum CLIProxyViewState { case idle, loading, loaded, storageUnavailable }
 private enum CLIPackageCatalog {
     static let candidates = CLIProvider.allCases
 }
@@ -87,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var authenticationStates: [UUID: CLIAuthenticationUIState] = [:]
     private var authenticationProcesses: [UUID: Process] = [:]
     private var checkingAuthenticationIDs = Set<UUID>()
+    private var authenticationCheckRevisions: [UUID: Int] = [:]
     private var cancelledAuthenticationIDs = Set<UUID>()
     private var activeLogoutIDs = Set<UUID>()
     private var activeRemovalIDs = Set<UUID>()
@@ -94,6 +96,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         automaticInstallations.map(CLIListItem.detected) + entries.map(CLIListItem.manual)
     }
     private var storageLoadFailed = false
+    private var cliProxyViewState: CLIProxyViewState = .idle
+    private var cliProxyPendingIDs = Set<UUID>()
+    private var cliProxyHadIndeterminateStatus = false
 
     private func navigationButton(_ title: String, symbol: String, action: Selector,
                                   selected: Bool) -> NSButton {
@@ -259,7 +264,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             proxy.trailingAnchor.constraint(equalTo: add.trailingAnchor),
             proxy.topAnchor.constraint(equalTo: add.bottomAnchor, constant: 6)
         ])
-        guard selectedSettingsSection == .add else { return }
+        guard selectedSettingsSection == .add else {
+            renderCLIProxy(in: body)
+            return
+        }
         let addButton = NSButton(image: NSImage(systemSymbolName: "plus", accessibilityDescription: "Abrir catálogo de CLIs")!,
                                  target: self, action: #selector(openCLICatalog))
         addButton.bezelStyle = .rounded
@@ -279,6 +287,138 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             addButton.heightAnchor.constraint(equalToConstant: 32)
         ])
         renderEntryList(in: body)
+    }
+
+    private func renderCLIProxy(in body: NSView) {
+        let title = label("CLIProxy", size: 22, weight: .semibold)
+        let subtitle = label("CLIs instaladas e autenticadas nos seus cadastros do PainelCli.",
+                             size: 12, color: .secondaryLabelColor)
+        body.addSubview(title)
+        body.addSubview(subtitle)
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        let document = TopAlignedDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scrollView.documentView = document
+        body.addSubview(scrollView)
+
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 24),
+            title.topAnchor.constraint(equalTo: body.topAnchor, constant: 24),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: body.trailingAnchor, constant: -24),
+            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
+            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: body.trailingAnchor, constant: -24),
+            scrollView.leadingAnchor.constraint(equalTo: body.leadingAnchor, constant: 24),
+            scrollView.trailingAnchor.constraint(equalTo: body.trailingAnchor, constant: -24),
+            scrollView.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 20),
+            scrollView.bottomAnchor.constraint(equalTo: body.bottomAnchor, constant: -24),
+            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor)
+        ])
+
+        switch cliProxyViewState {
+        case .idle, .loading:
+            let loadingRow = NSStackView()
+            loadingRow.orientation = .horizontal
+            loadingRow.alignment = .centerY
+            loadingRow.spacing = 10
+            loadingRow.translatesAutoresizingMaskIntoConstraints = false
+            let spinner = NSProgressIndicator()
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isIndeterminate = true
+            spinner.startAnimation(nil)
+            let message = label("Verificando o estado isolado das CLIs…", size: 13,
+                                color: .secondaryLabelColor)
+            loadingRow.addArrangedSubview(spinner)
+            loadingRow.addArrangedSubview(message)
+            stack.addArrangedSubview(loadingRow)
+            loadingRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        case .storageUnavailable:
+            addCLIProxyEmptyMessage("Não foi possível carregar os cadastros salvos. Nenhuma CLI foi listada.",
+                                    to: stack)
+        case .loaded:
+            let readyEntries = currentCLIProxyReadyEntries()
+            guard !readyEntries.isEmpty else {
+                let message = cliProxyHadIndeterminateStatus
+                    ? "Não foi possível confirmar algumas autenticações. Essas CLIs foram omitidas da lista."
+                    : "Nenhuma CLI manual está instalada e autenticada para o CLIProxy."
+                addCLIProxyEmptyMessage(message, to: stack)
+                return
+            }
+            for entry in readyEntries {
+                guard let target = CLIDiscoveryTarget(rawValue: entry.provider) else { continue }
+                let row = NSView()
+                row.translatesAutoresizingMaskIntoConstraints = false
+                row.heightAnchor.constraint(equalToConstant: 56).isActive = true
+                let appearance = detectedAppearance(for: target)
+                let icon = NSImageView()
+                icon.image = appearance.0
+                icon.contentTintColor = appearance.1
+                icon.imageScaling = .scaleProportionallyUpOrDown
+                icon.setAccessibilityElement(false)
+                icon.translatesAutoresizingMaskIntoConstraints = false
+                let name = label(entry.displayName, size: 13, weight: .medium)
+                let ready = label("Pronta", size: 11, color: .secondaryLabelColor)
+                let separator = Surface(.separatorColor)
+                [icon, name, ready, separator].forEach { row.addSubview($0) }
+                NSLayoutConstraint.activate([
+                    icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 4),
+                    icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    icon.widthAnchor.constraint(equalToConstant: 18),
+                    icon.heightAnchor.constraint(equalToConstant: 18),
+                    name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+                    name.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    ready.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+                    ready.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                    name.trailingAnchor.constraint(lessThanOrEqualTo: ready.leadingAnchor, constant: -12),
+                    separator.leadingAnchor.constraint(equalTo: name.leadingAnchor),
+                    separator.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                    separator.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+                    separator.heightAnchor.constraint(equalToConstant: 1)
+                ])
+                row.setAccessibilityElement(true)
+                row.setAccessibilityLabel("\(entry.displayName), pronta para CLIProxy")
+                stack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+        }
+    }
+
+    private func addCLIProxyEmptyMessage(_ message: String, to stack: NSStackView) {
+        let notice = NSTextField(wrappingLabelWithString: message)
+        notice.font = .systemFont(ofSize: 13)
+        notice.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(notice)
+        notice.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
+    private func currentCLIProxyReadyEntries() -> [CLIEntry] {
+        guard let installService else { return [] }
+        let installedIDs = Set(entries.compactMap { entry -> UUID? in
+            guard entry.origin == .manual,
+                  !installingRegistrationIDs.contains(entry.id),
+                  !activeLogoutIDs.contains(entry.id),
+                  !activeRemovalIDs.contains(entry.id),
+                  installService.registrationInstallStatus(for: entry) == .installed else { return nil }
+            return entry.id
+        })
+        return CLIProxyReadiness.readyEntries(entries, installedIDs: installedIDs,
+                                              authenticationStates: authenticationStates)
     }
 
     private func cliSymbol() -> NSImage? {
@@ -758,16 +898,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             entries = snapshot.manualRegistrations
             automaticInstallations = snapshot.detectedInstallations
             migrationNotice = snapshot.migrationNotice ?? migrationNotice
+            let currentIDs = Set(entries.map(\.id))
+            for id in Array(authenticationStates.keys) where !currentIDs.contains(id) {
+                invalidateAuthenticationCheck(for: id)
+            }
         } catch {
             storageLoadFailed = true
         }
     }
 
-    private func refreshAuthenticationStatuses() {
+    private func refreshEntriesForVisibleSection() {
+        if selectedSettingsSection == .cliProxy {
+            reloadManualRegistrationsForCLIProxy()
+        } else {
+            refreshCLIEntries()
+        }
+    }
+
+    private func invalidateAuthenticationCheck(for id: UUID) {
+        authenticationCheckRevisions[id, default: 0] += 1
+        checkingAuthenticationIDs.remove(id)
+        authenticationStates.removeValue(forKey: id)
+    }
+
+    private func refreshAuthenticationStatuses(forceIDs: Set<UUID> = []) {
         guard let service = installService else { return }
-        for entry in entries where entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue {
-            guard service.registrationInstallStatus(for: entry) == .installed,
-                  checkingAuthenticationIDs.insert(entry.id).inserted else { continue }
+        for entry in entries where entry.origin == .manual &&
+            (entry.provider == CLIProvider.codex.rawValue || entry.provider == CLIProvider.claude.rawValue) {
+            guard service.registrationInstallStatus(for: entry) == .installed else { continue }
+            if forceIDs.contains(entry.id) {
+                checkingAuthenticationIDs.remove(entry.id)
+            }
+            guard checkingAuthenticationIDs.insert(entry.id).inserted else { continue }
+            let revision = authenticationCheckRevisions[entry.id, default: 0] + 1
+            authenticationCheckRevisions[entry.id] = revision
             authenticationStates[entry.id] = .checking
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let state: CLIAuthenticationUIState
@@ -791,12 +955,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     state = .statusError("Não foi possível verificar o login isolado.")
                 }
                 DispatchQueue.main.async {
-                    guard let self else { return }
+                    guard let self,
+                          self.authenticationCheckRevisions[entry.id] == revision else { return }
                     self.checkingAuthenticationIDs.remove(entry.id)
                     self.authenticationStates[entry.id] = state
+                    if self.cliProxyPendingIDs.remove(entry.id) != nil {
+                        if case .statusError = state { self.cliProxyHadIndeterminateStatus = true }
+                        if self.cliProxyPendingIDs.isEmpty { self.cliProxyViewState = .loaded }
+                    }
                     if self.settingsButton.state == .on { self.render(.settings) }
                 }
             }
+        }
+    }
+
+    private func beginCLIProxyStatusRefresh() {
+        guard selectedSettingsSection == .cliProxy else { return }
+        guard !storageLoadFailed, let installService else {
+            cliProxyViewState = .storageUnavailable
+            cliProxyPendingIDs.removeAll()
+            render(.settings)
+            return
+        }
+        cliProxyHadIndeterminateStatus = false
+        let eligible = entries.filter {
+            $0.origin == .manual &&
+            ($0.provider == CLIProvider.codex.rawValue || $0.provider == CLIProvider.claude.rawValue) &&
+            !installingRegistrationIDs.contains($0.id) &&
+            !activeLogoutIDs.contains($0.id) &&
+            !activeRemovalIDs.contains($0.id) &&
+            !isAuthenticationRunningState(authenticationUIState(for: $0)) &&
+            authenticationProcesses[$0.id]?.isRunning != true &&
+            installService.registrationInstallStatus(for: $0) == .installed
+        }
+        cliProxyPendingIDs = Set(eligible.map(\.id))
+        guard !eligible.isEmpty else {
+            cliProxyViewState = .loaded
+            render(.settings)
+            return
+        }
+        cliProxyViewState = .loading
+        for entry in eligible { invalidateAuthenticationCheck(for: entry.id) }
+        render(.settings)
+        refreshAuthenticationStatuses(forceIDs: Set(eligible.map(\.id)))
+    }
+
+    private func refreshCLIProxySnapshotIfVisible() {
+        guard settingsButton?.state == .on, selectedSettingsSection == .cliProxy else { return }
+        reloadManualRegistrationsForCLIProxy()
+        beginCLIProxyStatusRefresh()
+    }
+
+    private func reloadManualRegistrationsForCLIProxy() {
+        guard let entryStore else {
+            storageLoadFailed = true
+            return
+        }
+        do {
+            entries = try entryStore.load()
+            storageLoadFailed = false
+            let currentIDs = Set(entries.map(\.id))
+            for id in Array(authenticationStates.keys) where !currentIDs.contains(id) {
+                invalidateAuthenticationCheck(for: id)
+            }
+        } catch {
+            storageLoadFailed = true
         }
     }
 
@@ -834,6 +1057,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertSecondButtonReturn else { return }
 
         activeRemovalIDs.insert(entry.id)
+        invalidateAuthenticationCheck(for: entry.id)
         render(.settings)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<Void, Error>
@@ -853,7 +1077,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.activeRemovalIDs.remove(entry.id)
-                self.refreshCLIEntries()
+                self.refreshEntriesForVisibleSection()
                 switch result {
                 case .success:
                     self.showRegistrationRemovalResult(
@@ -866,6 +1090,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         title: "Cadastro mantido",
                         message: error.localizedDescription + " A entrada continua disponível para nova tentativa.")
                 }
+                self.refreshCLIProxySnapshotIfVisible()
                 if self.settingsButton.state == .on { self.render(.settings) }
             }
         }
@@ -890,6 +1115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               installingRegistrationIDs.insert(entry.id).inserted else { return }
 
         installationFailures.removeValue(forKey: entry.id)
+        invalidateAuthenticationCheck(for: entry.id)
         render(.settings)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<URL, Error>
@@ -907,13 +1133,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             "Erro local ao preparar a instalação; nenhuma credencial foi usada."
                     }
                 }
-                self.refreshCLIEntries()
+                self.refreshEntriesForVisibleSection()
                 if case .success = result {
                     if entry.provider != CLIProvider.antigravity.rawValue {
                         self.authenticationStates[entry.id] = .notAuthenticated
+                        if self.selectedSettingsSection != .cliProxy {
+                            self.refreshAuthenticationStatuses()
+                        }
                     }
-                    self.refreshAuthenticationStatuses()
                 }
+                self.refreshCLIProxySnapshotIfVisible()
                 self.render(.settings)
             }
         }
@@ -935,6 +1164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard canStartAuthentication(for: entry) else { return }
+        invalidateAuthenticationCheck(for: entry.id)
         if entry.provider == CLIProvider.claude.rawValue {
             startClaudeLogin(for: entry, service: service)
             return
@@ -1136,6 +1366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         activeLogoutIDs.insert(entry.id)
+        invalidateAuthenticationCheck(for: entry.id)
         authenticationStates[entry.id] = .loggingOut
         render(.settings)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1173,6 +1404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if case .failure = result {
                     self.showStoreFailure("A CLI não confirmou a saída deste cadastro. O estado exibido vem de uma nova verificação isolada.")
                 }
+                self.refreshCLIProxySnapshotIfVisible()
                 if self.settingsButton.state == .on { self.render(.settings) }
             }
         }
@@ -1200,6 +1432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         installingRegistrationIDs.insert(entry.id)
+        invalidateAuthenticationCheck(for: entry.id)
         render(.settings)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<Void, Error>
@@ -1219,7 +1452,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case .failure(let error):
                     self.showStoreFailure("O pacote deste cadastro não foi removido integralmente. \(error.localizedDescription)")
                 }
-                self.refreshCLIEntries()
+                self.refreshEntriesForVisibleSection()
+                self.refreshCLIProxySnapshotIfVisible()
                 if self.settingsButton.state == .on { self.render(.settings) }
             }
         }
@@ -1372,6 +1606,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func showCLIProxy() {
         selectedSettingsSection = .cliProxy
+        reloadManualRegistrationsForCLIProxy()
+        beginCLIProxyStatusRefresh()
         render(.settings)
     }
     @objc func openWindow() {

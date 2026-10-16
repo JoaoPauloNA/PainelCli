@@ -136,6 +136,45 @@ require(CLIDiscoveryTarget.gemini.executableName == "gemini" &&
         CLIDiscoveryTarget.antigravity.executableName == "agy",
         "Gemini remains an independent detection target")
 
+let proxyCodexA = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0)
+let proxyCodexB = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 1)
+let proxyClaude = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 0)
+let proxySignedOut = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 2)
+let proxyUnknown = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 1)
+let proxyMissingStatus = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 3)
+let proxyFailed = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 3)
+let proxyUninstalled = CLIEntry(id: UUID(), provider: CLIProvider.claude.rawValue, ordinal: 2)
+let proxyAntigravity = CLIEntry(id: UUID(), provider: CLIProvider.antigravity.rawValue, ordinal: 0)
+let proxySystemCodex = CLIEntry(id: UUID(), provider: CLIProvider.codex.rawValue, ordinal: 0,
+                                origin: .automatic, detectedPath: "/usr/local/bin/codex")
+let proxyCandidates = [proxyCodexA, proxyCodexB, proxyClaude, proxySignedOut,
+                       proxyUnknown, proxyMissingStatus, proxyFailed, proxyUninstalled,
+                       proxyAntigravity, proxySystemCodex]
+let proxyInstalledIDs: Set<UUID> = [proxyCodexA.id, proxyCodexB.id, proxyClaude.id,
+                                     proxySignedOut.id, proxyUnknown.id, proxyMissingStatus.id,
+                                     proxyFailed.id, proxyAntigravity.id, proxySystemCodex.id]
+var proxyAuthenticationStates: [UUID: CLIAuthenticationUIState] = [
+    proxyCodexA.id: .authenticated,
+    proxyCodexB.id: .authenticated,
+    proxyClaude.id: .authenticated,
+    proxySignedOut.id: .notAuthenticated,
+    proxyUnknown.id: .statusError("synthetic status unavailable"),
+    proxyFailed.id: .failed("synthetic failure"),
+    proxyAntigravity.id: .authenticated,
+    proxySystemCodex.id: .authenticated
+]
+let initialProxyReady = CLIProxyReadiness.readyEntries(proxyCandidates,
+                                                       installedIDs: proxyInstalledIDs,
+                                                       authenticationStates: proxyAuthenticationStates)
+require(initialProxyReady.map(\.id) == [proxyCodexA.id, proxyCodexB.id, proxyClaude.id],
+        "CLIProxy includes each authenticated managed UUID and excludes system, Antigravity, unknown, signed-out, and uninstalled entries")
+proxyAuthenticationStates[proxyCodexA.id] = .notAuthenticated
+let refreshedProxyReady = CLIProxyReadiness.readyEntries(proxyCandidates,
+                                                         installedIDs: proxyInstalledIDs,
+                                                         authenticationStates: proxyAuthenticationStates)
+require(refreshedProxyReady.map(\.id) == [proxyCodexB.id, proxyClaude.id],
+        "a fresh signed-out status removes that UUID without collapsing sibling registrations")
+
 // Manual numbering starts at zero independently per provider. Detections never occupy ordinals.
 let store = CLIEntryStore(applicationSupportDirectory: testRoot)
 let codex1 = try store.add(provider: .codex)[0]
