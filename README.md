@@ -6,7 +6,7 @@ The compact list has two groups: **Instalações detectadas** displays unnumbere
 
 The installable catalog remains exactly CodexCLI, ClaudeCLI, and GeminiCLI. For manual registrations, the green/orange account controls remain an explicitly labeled, in-memory visual simulation; they do not indicate an authenticated account or run login/logout. The existing 56-point rows, inline icons, and native navigation materials are preserved.
 
-**Status: development. No production version has been approved.** Version 0.0.0.19 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
+**Status: development. No production version has been approved.** Version 0.0.0.20 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
 
 ## Build and test
 
@@ -35,3 +35,5 @@ See [LICENSE](LICENSE) for Apache License 2.0.
 Detected installations display only their unnumbered name, centered vertically, with no status subtitle. Discovery details remain available as a tooltip and accessibility help. Each detected target uses a distinct native SF Symbol: Codex — `chevron.left.forwardslash.chevron.right` (blue); Claude — `text.bubble` (orange); Gemini — `sparkles` (purple); Antigravity — `arrow.up.circle` (teal). These are system-provided identification cues, not official provider logos. No third-party brand asset is bundled or distributed. Source: https://developer.apple.com/sf-symbols/ . The existing account and trash controls remain visible but disabled for automatic detections; manual controls and numbering are preserved.
 
 Disabled account/trash controls use the semantic macOS disabled-control gray; enabled manual actions retain green/orange/red.
+
+Rows show two native symbols: CLI identity followed by origin (`desktopcomputer` for external discoveries; `app` for managed installations or manual registrations). Tooltips explicitly distinguish an app registration from a CLI actually installed by PainelCli. No installation or authentication is inferred from a manual record.

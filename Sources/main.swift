@@ -367,6 +367,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 icon.imageScaling = .scaleProportionallyUpOrDown
                 icon.setAccessibilityElement(false)
+                let origin = NSImageView()
+                let originSymbol: String
+                let originDescription: String
+                switch entry {
+                case .detected(let installation):
+                    originSymbol = installation.isManaged ? "app" : "desktopcomputer"
+                    originDescription = installation.isManaged ? "CLI instalada pelo PainelCli" : "CLI encontrada na máquina"
+                case .manual:
+                    originSymbol = "app"
+                    originDescription = "Cadastro do app · não indica instalação pelo PainelCli"
+                }
+                origin.image = NSImage(systemSymbolName: originSymbol, accessibilityDescription: originDescription)
+                origin.imageScaling = .scaleProportionallyUpOrDown
+                origin.contentTintColor = .secondaryLabelColor
+                origin.toolTip = originDescription
+                origin.setAccessibilityLabel(originDescription)
                 let name = label(entry.displayName, size: 13, weight: .medium)
                 let statusText = listStatus(for: entry)
                 let compactStatus: String
@@ -443,7 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 let installing = entry.manualEntry != nil && installingProviders.contains(entry.provider)
                 let canInstall = entry.manualEntry != nil && !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
-                [icon, name, status, actions].forEach {
+                [icon, origin, name, status, actions].forEach {
                     $0.translatesAutoresizingMaskIntoConstraints = false
                     row.addSubview($0)
                 }
@@ -481,7 +497,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
                     icon.widthAnchor.constraint(equalToConstant: 20),
                     icon.heightAnchor.constraint(equalToConstant: 20),
-                    name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+                    origin.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+                    origin.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+                    origin.widthAnchor.constraint(equalToConstant: 16),
+                    origin.heightAnchor.constraint(equalToConstant: 16),
+                    name.leadingAnchor.constraint(equalTo: origin.trailingAnchor, constant: 10),
                     entry.manualEntry == nil
                         ? name.centerYAnchor.constraint(equalTo: row.centerYAnchor)
                         : name.topAnchor.constraint(equalTo: row.topAnchor, constant: 9),
