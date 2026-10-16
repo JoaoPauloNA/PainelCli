@@ -138,6 +138,50 @@ _ = try detectedOnlyStore.snapshot(discoveries: discoveries)
 let codexAfterDetection = try detectedOnlyStore.add(provider: .codex).last
 require(codexAfterDetection?.ordinal == 0, "automatic detections do not occupy manual ordinals")
 
+// Exact live-store UI sequence: remove 0 while 1 and 2 remain, then add again without
+// recreating the store. A Codex detection is present throughout and never takes an ordinal.
+let dynamicStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("dynamic-gap"))
+let syntheticCodexDiscoveries = discoveries.filter { $0.target == .codex }
+let initialDynamicSnapshot = try dynamicStore.snapshot(discoveries: syntheticCodexDiscoveries)
+require(initialDynamicSnapshot.detectedInstallations.count == 1 &&
+        initialDynamicSnapshot.detectedInstallations[0].target == .codex,
+        "the dynamic sequence starts with a detected Codex installation")
+let initialDetectionID = initialDynamicSnapshot.detectedInstallations[0].id
+let dynamic0 = try dynamicStore.add(provider: .codex).last!
+let dynamic1 = try dynamicStore.add(provider: .codex).last!
+let dynamic2 = try dynamicStore.add(provider: .codex).last!
+require(dynamic0.displayName == "CodexCLI 0" && dynamic1.displayName == "CodexCLI 1" &&
+        dynamic2.displayName == "CodexCLI 2" &&
+        Set([dynamic0.id, dynamic1.id, dynamic2.id]).count == 3,
+        "three distinct manual registrations receive labels 0, 1, and 2")
+let afterRemovingZero = try dynamicStore.remove(id: dynamic0.id)
+require(!afterRemovingZero.contains(where: { $0.id == dynamic0.id }) &&
+        afterRemovingZero.first(where: { $0.id == dynamic1.id })?.ordinal == 1 &&
+        afterRemovingZero.first(where: { $0.id == dynamic1.id })?.displayName == "CodexCLI 1" &&
+        afterRemovingZero.first(where: { $0.id == dynamic2.id })?.ordinal == 2 &&
+        afterRemovingZero.first(where: { $0.id == dynamic2.id })?.displayName == "CodexCLI 2",
+        "removing zero leaves the IDs and ordinals of registrations 1 and 2 intact")
+let dynamicReplacement = try dynamicStore.add(provider: .codex).last!
+require(dynamicReplacement.ordinal == 0 && dynamicReplacement.displayName == "CodexCLI 0" &&
+        dynamicReplacement.id != dynamic0.id && dynamicReplacement.id != dynamic1.id &&
+        dynamicReplacement.id != dynamic2.id,
+        "the same live store assigns the freed zero to a new UUID instead of ordinal 3")
+let dynamicReload = try dynamicStore.load().filter { $0.provider == CLIProvider.codex.rawValue }
+require(dynamicReload.count == 3 &&
+        dynamicReload.first(where: { $0.id == dynamicReplacement.id })?.ordinal == 0 &&
+        dynamicReload.first(where: { $0.id == dynamic1.id })?.ordinal == 1 &&
+        dynamicReload.first(where: { $0.id == dynamic2.id })?.ordinal == 2,
+        "persisted and reloaded registrations retain the replacement and prior identities")
+let refreshedDynamicSnapshot = try dynamicStore.snapshot(discoveries: syntheticCodexDiscoveries)
+require(refreshedDynamicSnapshot.detectedInstallations.count == 1 &&
+        refreshedDynamicSnapshot.detectedInstallations[0].id == initialDetectionID &&
+        refreshedDynamicSnapshot.detectedInstallations[0].discoveryURL == syntheticCodex &&
+        refreshedDynamicSnapshot.manualRegistrations.count == 3 &&
+        refreshedDynamicSnapshot.manualRegistrations.first(where: { $0.id == dynamicReplacement.id })?.displayName == "CodexCLI 0" &&
+        refreshedDynamicSnapshot.manualRegistrations.first(where: { $0.id == dynamic1.id })?.displayName == "CodexCLI 1" &&
+        refreshedDynamicSnapshot.manualRegistrations.first(where: { $0.id == dynamic2.id })?.displayName == "CodexCLI 2",
+        "snapshot refresh retains the manual labels while keeping detection separate")
+
 // Catalog-origin Gemini registrations migrate only when no actual Gemini is detected and
 // their one-time zero-based ordinals do not collide with existing Antigravity registrations.
 let legacyMigrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("legacy-migration"))
