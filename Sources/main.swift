@@ -279,6 +279,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSImage(systemSymbolName: "terminal", accessibilityDescription: "CLI")
     }
 
+    // Native identification cues, not provider logos. Public builds distribute no third-party marks.
+    private func detectedAppearance(for target: CLIDiscoveryTarget) -> (NSImage?, NSColor) {
+        let symbol: String
+        let tint: NSColor
+        switch target {
+        case .codex:
+            symbol = "chevron.left.forwardslash.chevron.right"
+            tint = .systemBlue
+        case .claude:
+            symbol = "text.bubble"
+            tint = .systemOrange
+        case .gemini:
+            symbol = "sparkles"
+            tint = .systemPurple
+        case .antigravity:
+            symbol = "arrow.up.circle"
+            tint = .systemTeal
+        }
+        return (NSImage(systemSymbolName: symbol, accessibilityDescription: target.displayName) ?? cliSymbol(), tint)
+    }
+
     private func renderEntryList(in body: NSView) {
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -336,9 +357,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 row.translatesAutoresizingMaskIntoConstraints = false
                 row.heightAnchor.constraint(equalToConstant: 56).isActive = true
                 let icon = NSImageView()
-                icon.image = cliSymbol()
+                if case .detected(let installation) = entry {
+                    let appearance = detectedAppearance(for: installation.target)
+                    icon.image = appearance.0
+                    icon.contentTintColor = appearance.1
+                } else {
+                    icon.image = cliSymbol()
+                    icon.contentTintColor = .secondaryLabelColor
+                }
                 icon.imageScaling = .scaleProportionallyUpOrDown
-                icon.contentTintColor = .secondaryLabelColor
                 icon.setAccessibilityElement(false)
                 let name = label(entry.displayName, size: 13, weight: .medium)
                 let statusText = listStatus(for: entry)
@@ -351,6 +378,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     compactStatus = statusText
                 }
                 let status = label(compactStatus, size: 11, color: .secondaryLabelColor)
+                status.isHidden = entry.manualEntry == nil
+                name.toolTip = statusText
+                name.setAccessibilityHelp(statusText)
                 status.lineBreakMode = .byTruncatingTail
                 status.maximumNumberOfLines = 1
                 status.toolTip = statusText
@@ -451,7 +481,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     icon.widthAnchor.constraint(equalToConstant: 20),
                     icon.heightAnchor.constraint(equalToConstant: 20),
                     name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-                    name.topAnchor.constraint(equalTo: row.topAnchor, constant: 9),
+                    entry.manualEntry == nil
+                        ? name.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+                        : name.topAnchor.constraint(equalTo: row.topAnchor, constant: 9),
                     name.trailingAnchor.constraint(lessThanOrEqualTo: textTrailing, constant: -12),
                     status.leadingAnchor.constraint(equalTo: name.leadingAnchor),
                     status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 3),

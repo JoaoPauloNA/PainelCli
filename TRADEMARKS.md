@@ -9,3 +9,5 @@ Apache License 2.0 applies to the PainelCli code only. It does not grant rights 
 - OpenAI: <https://openai.com/brand/>
 - Anthropic: <https://www.anthropic.com/press-kit>
 - Google: <https://about.google/brand-resource-center/guidance/>
+
+Detected-row symbols are native SF Symbols used as generic identification cues, not brand logos or official CLI artwork. No shape or asset is presented as an OpenAI, Anthropic, Google, or Antigravity logo. See https://developer.apple.com/sf-symbols/ for the system symbol source. Provider-name labels carry the actual identity.
