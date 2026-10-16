@@ -84,6 +84,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var migrationNotice: String?
     private var installingRegistrationIDs = Set<UUID>()
     private var installationFailures: [UUID: String] = [:]
+    private var authenticationStates: [UUID: CLIAuthenticationUIState] = [:]
+    private var authenticationProcesses: [UUID: Process] = [:]
+    private var checkingAuthenticationIDs = Set<UUID>()
+    private var cancelledAuthenticationIDs = Set<UUID>()
     private var listItems: [CLIListItem] {
         automaticInstallations.map(CLIListItem.detected) + entries.map(CLIListItem.manual)
     }
@@ -198,6 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenu.addItem(withTitle: "Sair", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         statusItem.menu = statusMenu
         openWindow()
+        refreshAuthenticationStatuses()
     }
 
     private func render(_ screen: Screen) {
@@ -446,11 +451,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.isBordered = false
                 account.tag = index
                 let isManualEntry = entry.manualEntry != nil
-                account.isEnabled = false
-                account.contentTintColor = .disabledControlTextColor
-                account.toolTip = "Login indisponível até haver perfil isolado por cadastro"
-                account.setAccessibilityLabel("Login indisponível para \(entry.displayName)")
-                account.setAccessibilityValue("Perfil isolado por cadastro não disponível")
+                let codexRegistration = entry.manualEntry.flatMap {
+                    $0.provider == CLIProvider.codex.rawValue ? $0 : nil
+                }
+                let authState = codexRegistration.map { authenticationUIState(for: $0) }
+                let canCancelLogin = codexRegistration.map {
+                    [.starting, .awaitingBrowser].contains(authenticationUIState(for: $0)) &&
+                    authenticationProcesses[$0.id]?.isRunning == true
+                } ?? false
+                let canStartLogin = codexRegistration.map { canStartAuthentication(for: $0) } ?? false
+                account.target = self
+                account.action = #selector(loginCLI(_:))
+                account.isEnabled = !storageLoadFailed && (canStartLogin || canCancelLogin)
+                account.contentTintColor = account.isEnabled ? .controlAccentColor : .disabledControlTextColor
+                if canCancelLogin {
+                    account.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "Cancelar login")
+                    account.toolTip = "Cancelar login deste cadastro"
+                    account.setAccessibilityLabel("Cancelar login de \(entry.displayName)")
+                } else {
+                    account.toolTip = codexRegistration == nil
+                        ? "Login disponível somente para um Codex instalado neste cadastro"
+                        : authState?.displayText ?? "Login disponível somente após a instalação isolada"
+                    account.setAccessibilityLabel(codexRegistration == nil
+                        ? "Login indisponível para \(entry.displayName)"
+                        : "Entrar em \(entry.displayName)")
+                }
+                account.setAccessibilityValue(authState?.displayText ?? "Login indisponível")
                 account.translatesAutoresizingMaskIntoConstraints = false
                 actions.addArrangedSubview(account)
                 account.widthAnchor.constraint(equalToConstant: 28).isActive = true
@@ -462,7 +488,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 remove.isBordered = false
                 remove.tag = index
                 remove.isEnabled = isManualEntry && !storageLoadFailed &&
-                    entry.manualEntry.map { !installingRegistrationIDs.contains($0.id) } == true
+                    entry.manualEntry.map {
+                        !installingRegistrationIDs.contains($0.id) &&
+                        authenticationProcesses[$0.id]?.isRunning != true
+                    } == true
                 remove.contentTintColor = remove.isEnabled ? .systemRed : .disabledControlTextColor
                 remove.toolTip = isManualEntry
                     ? "Remover \(entry.displayName) da lista"
@@ -548,7 +577,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return "Cadastro legado GeminiCLI · encontrada no sistema · \(displayLocation(detection.discoveryURL))"
         }
-        return registrationInstallState(for: entry).displayText
+        let installState = registrationInstallState(for: entry)
+        guard installState == .installed else { return installState.displayText }
+        return authenticationUIState(for: entry).displayText
+    }
+
+    private func authenticationUIState(for entry: CLIEntry) -> CLIAuthenticationUIState {
+        authenticationStates[entry.id] ?? (checkingAuthenticationIDs.contains(entry.id) ? .checking : .notAuthenticated)
+    }
+
+    private func canStartAuthentication(for entry: CLIEntry) -> Bool {
+        guard installService?.registrationInstallStatus(for: entry) == .installed,
+              !checkingAuthenticationIDs.contains(entry.id),
+              authenticationProcesses[entry.id]?.isRunning != true else { return false }
+        switch authenticationUIState(for: entry) {
+        case .notAuthenticated, .failed, .cancelled: return true
+        case .checking, .starting, .awaitingBrowser, .authenticated: return false
+        }
     }
 
     private func registrationInstallState(for entry: CLIEntry) -> CLIRegistrationInstallStatus {
@@ -584,6 +629,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             migrationNotice = snapshot.migrationNotice ?? migrationNotice
         } catch {
             storageLoadFailed = true
+        }
+    }
+
+    private func refreshAuthenticationStatuses() {
+        guard let service = installService else { return }
+        for entry in entries where entry.provider == CLIProvider.codex.rawValue {
+            guard service.registrationInstallStatus(for: entry) == .installed,
+                  checkingAuthenticationIDs.insert(entry.id).inserted else { continue }
+            authenticationStates[entry.id] = .checking
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let state: CLIAuthenticationUIState
+                do {
+                    switch try service.authenticationStatus(for: entry) {
+                    case .authenticated: state = .authenticated
+                    case .notAuthenticated: state = .notAuthenticated
+                    }
+                } catch let error as CLIInstallError {
+                    state = .failed(error.errorDescription ?? "Não foi possível verificar o login.")
+                } catch {
+                    state = .failed("Não foi possível verificar o login isolado.")
+                }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.checkingAuthenticationIDs.remove(entry.id)
+                    self.authenticationStates[entry.id] = state
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+            }
         }
     }
 
@@ -628,7 +701,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
                 self.refreshCLIEntries()
+                if case .success = result {
+                    self.authenticationStates[entry.id] = .notAuthenticated
+                    self.refreshAuthenticationStatuses()
+                }
                 self.render(.settings)
+            }
+        }
+    }
+
+    @objc private func loginCLI(_ sender: NSButton) {
+        guard !storageLoadFailed, let service = installService,
+              listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry,
+              entry.provider == CLIProvider.codex.rawValue,
+              service.registrationInstallStatus(for: entry) == .installed else { return }
+
+        if [.starting, .awaitingBrowser].contains(authenticationStates[entry.id] ?? .notAuthenticated),
+           let process = authenticationProcesses[entry.id], process.isRunning {
+            cancelledAuthenticationIDs.insert(entry.id)
+            authenticationStates[entry.id] = .cancelled
+            process.terminate()
+            render(.settings)
+            return
+        }
+        guard canStartAuthentication(for: entry) else { return }
+        cancelledAuthenticationIDs.remove(entry.id)
+        authenticationStates[entry.id] = .starting
+        render(.settings)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let process = try service.startAuthentication(for: entry)
+                DispatchQueue.main.async {
+                    guard let self else { process.terminate(); return }
+                    self.authenticationProcesses[entry.id] = process
+                    self.authenticationStates[entry.id] = .starting
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+                var browserOpened = false
+                for _ in 0..<300 {
+                    guard process.isRunning else { break }
+                    if service.authenticationBrowserOpened(for: entry) {
+                        browserOpened = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+                if browserOpened {
+                    DispatchQueue.main.async {
+                        guard let self,
+                              self.cancelledAuthenticationIDs.contains(entry.id) == false else { return }
+                        self.authenticationStates[entry.id] = .awaitingBrowser
+                        if self.settingsButton.state == .on { self.render(.settings) }
+                    }
+                } else if process.isRunning {
+                    process.terminate()
+                }
+                process.waitUntilExit()
+                let authenticated = (try? service.authenticationStatus(for: entry)) == .authenticated
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.authenticationProcesses.removeValue(forKey: entry.id)
+                    if authenticated {
+                        self.authenticationStates[entry.id] = .authenticated
+                    } else if self.cancelledAuthenticationIDs.remove(entry.id) != nil {
+                        self.authenticationStates[entry.id] = .cancelled
+                    } else if !browserOpened {
+                        self.authenticationStates[entry.id] = .failed("O CLI não confirmou que abriu o Chrome isolado; o login foi interrompido.")
+                    } else if process.terminationStatus == 0 {
+                        self.authenticationStates[entry.id] = .failed("A CLI encerrou sem confirmar a autenticação.")
+                    } else {
+                        self.authenticationStates[entry.id] = .failed("O fluxo oficial terminou sem autenticação confirmada.")
+                    }
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+            } catch let error as CLIInstallError {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.authenticationStates[entry.id] = .failed(error.errorDescription ?? "Login não iniciado.")
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.authenticationStates[entry.id] = .failed("Não foi possível iniciar o login isolado.")
+                    if self.settingsButton.state == .on { self.render(.settings) }
+                }
             }
         }
     }

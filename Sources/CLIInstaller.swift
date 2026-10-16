@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreFoundation
 
 /// Providers offered for manual registration. Codex installation is UUID-scoped;
 /// login and the other providers' installers remain unavailable.
@@ -91,6 +92,9 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
     case incompleteInstallation
     case commandFailed(Int32)
     case commandTimedOut
+    case authenticationPolicyBlocked
+    case authenticationStorageUnavailable
+    case chromeUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -110,6 +114,39 @@ enum CLIInstallError: Error, Equatable, LocalizedError {
             return "npm terminou com erro (código \(status)); este cadastro não foi marcado como instalado."
         case .commandTimedOut:
             return "npm excedeu 15 minutos; este cadastro não foi marcado como instalado."
+        case .authenticationPolicyBlocked:
+            return "A política local não confirma armazenamento de credenciais isolado em arquivo; login bloqueado."
+        case .authenticationStorageUnavailable:
+            return "O login não pôde ser confirmado no arquivo privado deste cadastro."
+        case .chromeUnavailable:
+            return "Não encontrei o Google Chrome para abrir o login neste perfil isolado."
+        }
+    }
+}
+
+enum CLIAuthenticationStatus: Equatable {
+    case notAuthenticated
+    case authenticated
+}
+
+enum CLIAuthenticationUIState: Equatable {
+    case checking
+    case notAuthenticated
+    case starting
+    case awaitingBrowser
+    case authenticated
+    case failed(String)
+    case cancelled
+
+    var displayText: String {
+        switch self {
+        case .checking: return "Verificando login isolado…"
+        case .notAuthenticated: return "Login não configurado neste cadastro"
+        case .starting: return "Iniciando login isolado…"
+        case .awaitingBrowser: return "Aguardando autenticação no Chrome com perfil isolado"
+        case .authenticated: return "Autenticado neste cadastro"
+        case .failed(let message): return "Falha no login isolado · \(message)"
+        case .cancelled: return "Login isolado cancelado"
         }
     }
 }
@@ -142,8 +179,21 @@ enum CLIRegistrationInstallStatus: Equatable {
 }
 
 typealias CLICommandRunner = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Int32
+typealias CLIAuthenticationProcessLauncher = (_ executable: URL, _ arguments: [String], _ environment: [String: String]) throws -> Process
 
 private enum CLIProcessExecutor {
+    static func start(executable: URL, arguments: [String], environment: [String: String]) throws -> Process {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        return process
+    }
+
     static func run(executable: URL, arguments: [String], environment: [String: String]) throws -> Int32 {
         let process = Process()
         process.executableURL = executable
@@ -185,6 +235,7 @@ struct CLIInstallService {
     private let npmExecutableOverride: URL?
     private let nodeExecutableOverride: URL?
     private let processRunner: CLICommandRunner
+    private let authenticationProcessLauncher: CLIAuthenticationProcessLauncher
 
     init(applicationSupportDirectory: URL,
          fileManager: FileManager = .default,
@@ -194,7 +245,8 @@ struct CLIInstallService {
          knownExecutableOverrides: [CLIDiscoveryTarget: [URL]]? = nil,
          npmExecutableOverride: URL? = nil,
          nodeExecutableOverride: URL? = nil,
-         processRunner: @escaping CLICommandRunner = CLIProcessExecutor.run) {
+         processRunner: @escaping CLICommandRunner = CLIProcessExecutor.run,
+         authenticationProcessLauncher: @escaping CLIAuthenticationProcessLauncher = CLIProcessExecutor.start) {
         self.fileManager = fileManager
         self.applicationDirectory = applicationSupportDirectory
             .appendingPathComponent("PainelCli", isDirectory: true)
@@ -205,6 +257,7 @@ struct CLIInstallService {
         self.npmExecutableOverride = npmExecutableOverride
         self.nodeExecutableOverride = nodeExecutableOverride
         self.processRunner = processRunner
+        self.authenticationProcessLauncher = authenticationProcessLauncher
     }
 
     static func userService() throws -> CLIInstallService {
@@ -380,6 +433,151 @@ struct CLIInstallService {
         return result
     }
 
+    /// Checks credentials using only this UUID's executable and environment. CLI output is
+    /// discarded; callers receive only the documented exit-status result.
+    func authenticationStatus(for entry: CLIEntry) throws -> CLIAuthenticationStatus {
+        guard registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        try validateAuthenticationPolicy(for: entry)
+        let executable = managedExecutableURL(for: entry)
+        let status = try processRunner(executable, ["login", "status"],
+                                       isolatedRuntimeEnvironment(for: entry))
+        guard status == 0 else { return .notAuthenticated }
+        let codexHome = installationRoot(for: entry).appendingPathComponent("codex-home", isDirectory: true)
+        let authFile = codexHome.appendingPathComponent("auth.json")
+        guard hasPrivatePermissions(codexHome, allowingOwnerMode: 0o700),
+              hasPrivatePermissions(authFile, allowingOwnerMode: 0o600) else {
+            throw CLIInstallError.authenticationStorageUnavailable
+        }
+        return .authenticated
+    }
+
+    /// Starts only the official CLI's ChatGPT OAuth flow. A scoped `open` launcher routes
+    /// its browser request into a dedicated Chrome profile without changing the system default.
+    func startAuthentication(for entry: CLIEntry) throws -> Process {
+        guard registrationInstallStatus(for: entry) == .installed else {
+            throw CLIInstallError.incompleteInstallation
+        }
+        try validateAuthenticationPolicy(for: entry)
+        guard fileManager.fileExists(atPath: Self.chromeExecutablePath) else {
+            throw CLIInstallError.chromeUnavailable
+        }
+        let browserLauncher = try prepareBrowserLauncher(for: entry)
+        var isolatedEnvironment = try isolatedRuntimeEnvironment(for: entry)
+        isolatedEnvironment["PATH"] = browserLauncher.path + ":" + (isolatedEnvironment["PATH"] ?? "/usr/bin:/bin")
+
+        return try authenticationProcessLauncher(managedExecutableURL(for: entry), ["login"], isolatedEnvironment)
+    }
+
+    func authenticationBrowserOpened(for entry: CLIEntry) -> Bool {
+        let marker = installationRoot(for: entry)
+            .appendingPathComponent("codex-home/browser-profile-opened")
+        return fileManager.fileExists(atPath: marker.path)
+    }
+
+    private func prepareBrowserLauncher(for entry: CLIEntry) throws -> URL {
+        let launcherDirectory = registrationDirectory(for: entry)
+            .appendingPathComponent("browser-launcher", isDirectory: true)
+        try fileManager.createDirectory(at: launcherDirectory, withIntermediateDirectories: true)
+        try setPrivatePermissions(launcherDirectory)
+        let launcher = launcherDirectory.appendingPathComponent("open")
+        let browserOpenedMarker = installationRoot(for: entry)
+            .appendingPathComponent("codex-home/browser-profile-opened")
+        try? fileManager.removeItem(at: browserOpenedMarker)
+        let script = #"""
+        #!/bin/sh
+        set -eu
+        url=""
+        for arg in "$@"; do
+            case "$arg" in
+                https://*)
+                    if [ -n "$url" ]; then exit 64; fi
+                    url="$arg"
+                    ;;
+            esac
+        done
+        case "$url" in
+            https://auth.openai.com/*|https://chatgpt.com/*) ;;
+            *) exit 64 ;;
+        esac
+        profile="$CODEX_HOME/browser-profile"
+        if /usr/bin/open -na "/Applications/Google Chrome.app" --args \
+            --user-data-dir="$profile" --no-first-run --no-default-browser-check --new-window "$url"; then
+            : > "$CODEX_HOME/browser-profile-opened"
+            /bin/chmod 600 "$CODEX_HOME/browser-profile-opened"
+        else
+            exit $?
+        fi
+        """#
+        try Data(script.utf8).write(to: launcher, options: .atomic)
+        try setPrivatePermissions(launcher, mode: 0o700)
+        return launcherDirectory
+    }
+
+    /// Admin-enforced credential policies outrank the instance config. Inspect only the
+    /// relevant auth keys from system/managed files and macOS managed preferences; never
+    /// emit their contents. Cloud requirements do not control these local auth settings.
+    private func validateAuthenticationPolicy(for entry: CLIEntry) throws {
+        var policyDocuments: [String] = []
+        for path in ["/etc/codex/requirements.toml", "/etc/codex/managed_config.toml"] {
+            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                policyDocuments.append(contents)
+            }
+        }
+        for key in ["config_toml_base64", "requirements_toml_base64"] {
+            if let encoded = CFPreferencesCopyAppValue(key as CFString,
+                                                       "com.openai.codex" as CFString) as? String,
+               let data = Data(base64Encoded: encoded),
+               let decoded = String(data: data, encoding: .utf8) {
+                policyDocuments.append(decoded)
+            }
+        }
+
+        let instanceConfig = installationRoot(for: entry).appendingPathComponent("codex-home/config.toml")
+        guard let config = try? String(contentsOf: instanceConfig, encoding: .utf8),
+              Self.authenticationPolicyAllowsFile(documents: policyDocuments, instanceConfig: config) else {
+            throw CLIInstallError.authenticationPolicyBlocked
+        }
+    }
+
+    static func authenticationPolicyAllowsFile(documents: [String], instanceConfig: String) -> Bool {
+        guard rootSetting("cli_auth_credentials_store", in: instanceConfig) == "file" else { return false }
+        for document in documents {
+            if let store = rootSetting("cli_auth_credentials_store", in: document), store != "file" {
+                return false
+            }
+            if let methods = rootSetting("allowed_login_methods", in: document),
+               !methods.contains("\"chatgpt\"") {
+                return false
+            }
+            if let workspaces = rootSetting("allowed_chatgpt_workspaces", in: document),
+               workspaces.trimmingCharacters(in: .whitespacesAndNewlines) == "[]" {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func rootSetting(_ key: String, in document: String) -> String? {
+        var inRootTable = true
+        for line in document.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") { inRootTable = false; continue }
+            guard inRootTable, let equal = trimmed.firstIndex(of: "=") else { continue }
+            let name = trimmed[..<equal].trimmingCharacters(in: .whitespaces)
+            guard name == key else { continue }
+            let raw = trimmed[trimmed.index(after: equal)...]
+                .split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            if raw.first == "\"", let end = raw.dropFirst().firstIndex(of: "\"") {
+                return String(raw[raw.index(after: raw.startIndex)..<end])
+            }
+            return raw
+        }
+        return nil
+    }
+
     func registrationDirectory(for entry: CLIEntry) -> URL {
         applicationDirectory.appendingPathComponent("Registrations", isDirectory: true)
             .appendingPathComponent(entry.id.uuidString, isDirectory: true)
@@ -459,7 +657,17 @@ struct CLIInstallService {
                                       ofItemAtPath: url.path)
     }
 
+    private func hasPrivatePermissions(_ url: URL, allowingOwnerMode: Int16) -> Bool {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular ||
+                attributes[.type] as? FileAttributeType == .typeDirectory,
+              let permissions = attributes[.posixPermissions] as? NSNumber else { return false }
+        let mode = permissions.int16Value
+        return mode & 0o077 == 0 && mode & allowingOwnerMode == allowingOwnerMode
+    }
+
     private static let codexExecutableRelativePath = "package/node_modules/.bin/codex"
+    private static let chromeExecutablePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
     private struct InstallManifest: Codable {
         let registrationID: UUID

@@ -217,6 +217,88 @@ require(originalCodexConfigText.contains("cli_auth_credentials_store = \"file\""
         !fileManager.fileExists(atPath: originalInstallDirectory.appendingPathComponent(
             "installation/codex-home/auth.json").path),
         "each Codex home selects file credentials; installation performs no login")
+
+var authenticationCommand: (URL, [String], [String: String])?
+var authenticationStatusCommand: (URL, [String], [String: String])?
+let syntheticAuthService = CLIInstallService(
+    applicationSupportDirectory: testRoot.appendingPathComponent("install-support"),
+    environment: installEnvironment,
+    homeDirectory: hostHome,
+    additionalSearchDirectories: [],
+    knownExecutableOverrides: [:],
+    processRunner: { executable, arguments, environment in
+        authenticationStatusCommand = (executable, arguments, environment)
+        return 1
+    },
+    authenticationProcessLauncher: { executable, arguments, environment in
+        authenticationCommand = (executable, arguments, environment)
+        return Process()
+    })
+let syntheticAuthenticationStatus = try syntheticAuthService.authenticationStatus(for: originalRegistration)
+require(syntheticAuthenticationStatus == .notAuthenticated,
+        "isolated login status maps the synthetic nonzero command result to not authenticated")
+let fakeAuthProcess = try syntheticAuthService.startAuthentication(for: originalRegistration)
+require(authenticationStatusCommand?.1 == ["login", "status"] &&
+        authenticationCommand?.1 == ["login"] &&
+        authenticationCommand?.0 == originalInstallExecutable,
+        "status and browser login target only the Codex 0 executable with fixed arguments")
+require(authenticationStatusCommand?.2["CODEX_HOME"] == originalInstallDirectory
+            .appendingPathComponent("installation/codex-home").path &&
+        authenticationCommand?.2["HOME"] == originalInstallDirectory
+            .appendingPathComponent("installation/home").path &&
+        authenticationCommand?.2["OPENAI_API_KEY"] == nil &&
+        authenticationCommand?.2["NPM_TOKEN"] == nil,
+        "login and status inherit the instance runtime environment without host credentials")
+let browserLauncher = originalInstallDirectory.appendingPathComponent("browser-launcher/open")
+let browserLauncherText = try String(contentsOf: browserLauncher, encoding: .utf8)
+require(fileManager.isExecutableFile(atPath: browserLauncher.path) &&
+        browserLauncherText.contains("https://auth.openai.com/*") &&
+        browserLauncherText.contains("Google Chrome.app") &&
+        browserLauncherText.contains("--user-data-dir=\"$profile\"") &&
+        !browserLauncherText.contains("Safari"),
+        "the scoped launcher accepts official login origins and opens a dedicated Chrome profile")
+_ = fakeAuthProcess
+require(CLIInstallService.authenticationPolicyAllowsFile(
+            documents: ["cli_auth_credentials_store = \"file\"\nallowed_login_methods = [\"chatgpt\"]"],
+            instanceConfig: "cli_auth_credentials_store = \"file\"\n"),
+        "file credential storage and permitted ChatGPT auth satisfy the local preflight")
+require(!CLIInstallService.authenticationPolicyAllowsFile(
+            documents: ["cli_auth_credentials_store = \"keyring\""],
+            instanceConfig: "cli_auth_credentials_store = \"file\"\n") &&
+        !CLIInstallService.authenticationPolicyAllowsFile(
+            documents: ["allowed_login_methods = [\"api\"]"],
+            instanceConfig: "cli_auth_credentials_store = \"file\"\n") &&
+        !CLIInstallService.authenticationPolicyAllowsFile(
+            documents: ["allowed_chatgpt_workspaces = []"],
+            instanceConfig: "cli_auth_credentials_store = \"file\"\n"),
+        "keyring or a policy that blocks ChatGPT login prevents OAuth before authentication")
+let statusWithoutAuthFileService = CLIInstallService(
+    applicationSupportDirectory: testRoot.appendingPathComponent("install-support"),
+    environment: installEnvironment,
+    homeDirectory: hostHome,
+    additionalSearchDirectories: [],
+    knownExecutableOverrides: [:],
+    processRunner: { _, _, _ in 0 })
+do {
+    _ = try statusWithoutAuthFileService.authenticationStatus(for: originalRegistration)
+    fatalError("CLI status alone must not claim isolated authentication without its private file")
+} catch CLIInstallError.authenticationStorageUnavailable {
+}
+let syntheticAuthFile = originalInstallDirectory.appendingPathComponent("installation/codex-home/auth.json")
+try Data("synthetic-only-not-a-token".utf8).write(to: syntheticAuthFile, options: .atomic)
+try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o600)],
+                              ofItemAtPath: syntheticAuthFile.path)
+let authenticatedWithPrivateFile = try statusWithoutAuthFileService.authenticationStatus(for: originalRegistration)
+require(authenticatedWithPrivateFile == .authenticated,
+        "an isolated successful CLI status requires a private per-instance auth file")
+try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o644)],
+                              ofItemAtPath: syntheticAuthFile.path)
+do {
+    _ = try statusWithoutAuthFileService.authenticationStatus(for: originalRegistration)
+    fatalError("a world-readable auth file must not confirm isolated authentication")
+} catch CLIInstallError.authenticationStorageUnavailable {
+}
+try fileManager.removeItem(at: syntheticAuthFile)
 let isolatedRuntime = try codexInstallService.isolatedRuntimeEnvironment(for: originalRegistration)
 require(isolatedRuntime["CODEX_HOME"] == originalInstallDirectory.appendingPathComponent(
             "installation/codex-home").path &&
