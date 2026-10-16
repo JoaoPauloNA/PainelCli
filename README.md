@@ -6,7 +6,7 @@ The compact list has two groups: **Instalações detectadas** displays unnumbere
 
 The manual-registration catalog is exactly CodexCLI, ClaudeCLI, and Antigravity CLI. Selecting a catalog item records metadata only. CodexCLI installs and authenticates per registration through the official CLI, with a UUID-scoped package directory, `CODEX_HOME`, and credential file. The account button is enabled only for an installed manual Codex registration. Login status is confirmed with `codex login status` in that instance and requires a private `auth.json`; CLI discovery never enables login. Claude and Antigravity installation/login remain unavailable. Legacy GeminiCLI registrations migrate to Antigravity only when no real Gemini executable is detected and the migrated ordinal does not collide; otherwise they remain intact and the app asks for an explicit decision.
 
-**Status: development. No production version has been approved.** Version 0.0.0.27 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
+**Status: development. No production version has been approved.** Version 0.0.0.28 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
 
 ## Build and test
 
@@ -37,3 +37,7 @@ Detected installations display only their unnumbered name, centered vertically, 
 Disabled account/install/trash controls use the semantic macOS disabled-control gray; manual removal remains enabled.
 
 Rows show two native symbols: CLI identity followed by origin (`desktopcomputer` for external discoveries; `app` for managed installations or manual registrations). Tooltips distinguish a manual registration from its UUID-scoped installation status. Installation is never inferred from a provider-wide discovery; login is not inferred from an install.
+
+## Compact action presentation
+
+All row actions are icon-only with 28 × 28 pt controls and the same native 14 pt symbol configuration. Download (`arrow.down.circle`) installs; package (`shippingbox`) uninstalls; person (`person.crop.circle`) starts login; power (`power`) logs out; cancel (`xmark.circle`) cancels a running login; trash removes a manual registration. Tooltips and accessibility names identify each action. Enabled login is green, logout/cancel/uninstall orange, remove red; disabled actions use native semantic gray. These colors and symbols do not determine action availability. UUID-scoped handlers and uncertain-state guards remain the source of behavior. No Code/device/clipboard action is present.

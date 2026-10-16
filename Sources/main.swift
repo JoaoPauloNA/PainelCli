@@ -305,6 +305,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return (NSImage(systemSymbolName: symbol, accessibilityDescription: target.displayName) ?? cliSymbol(), tint)
     }
 
+    // Visual normalization only: never changes enabled state, tag, target, or action.
+    private func applyActionAppearance(_ button: NSButton) {
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.controlSize = .small
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.image = button.image?.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+    }
+
     // Presentation only. The caller owns availability, target/action, and isolated-install rules.
     private func makeInstallButton(displayName: String, tag: Int) -> NSButton {
         let button = NSButton(image: NSImage(systemSymbolName: "arrow.down.circle",
@@ -465,13 +477,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.action = isAuthenticated ? #selector(logoutCLI(_:)) : #selector(loginCLI(_:))
                 account.isEnabled = !storageLoadFailed &&
                     (canCancelLogin || (installState == .installed && (isAuthenticated || canStartLogin)))
-                account.contentTintColor = account.isEnabled ? .controlAccentColor : .disabledControlTextColor
+                account.contentTintColor = account.isEnabled
+                    ? ((canCancelLogin || isAuthenticated) ? .systemOrange : .systemGreen)
+                    : .disabledControlTextColor
                 if canCancelLogin {
                     account.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: "Cancelar login")
                     account.toolTip = "Cancelar login deste cadastro"
                     account.setAccessibilityLabel("Cancelar login de \(entry.displayName)")
                 } else if isAuthenticated {
-                    account.image = NSImage(systemSymbolName: "rectangle.portrait.and.arrow.right",
+                    account.image = NSImage(systemSymbolName: "power",
                                             accessibilityDescription: "Sair")
                     account.toolTip = "Sair deste cadastro e limpar as credenciais locais. Isso não revoga a sessão remotamente."
                     account.setAccessibilityLabel("Sair de \(entry.displayName)")
@@ -492,6 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         : "Entrar pelo navegador em \(entry.displayName)")
                 }
                 account.setAccessibilityValue(authState?.displayText ?? "Login indisponível")
+                applyActionAppearance(account)
                 account.translatesAutoresizingMaskIntoConstraints = false
                 actions.addArrangedSubview(account)
                 account.widthAnchor.constraint(equalToConstant: 28).isActive = true
@@ -514,7 +529,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 remove.setAccessibilityLabel(isManualEntry
                     ? "Remover \(entry.displayName) da lista"
                     : "Remoção indisponível para instalação detectada \(entry.displayName)")
-                remove.setAccessibilityValue(isManualEntry ? "Disponível" : "Inativo")
+                remove.setAccessibilityValue(remove.isEnabled ? "Disponível" : "Inativo")
+                applyActionAppearance(remove)
                 remove.translatesAutoresizingMaskIntoConstraints = false
                 actions.addArrangedSubview(remove)
                 remove.widthAnchor.constraint(equalToConstant: 28).isActive = true
@@ -532,7 +548,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     let isInstalled = state == .installed
                     let actionSymbol: String
                     if isInstalled {
-                        actionSymbol = "trash"
+                        actionSymbol = "shippingbox"
                     } else if state == .incomplete {
                         actionSymbol = "exclamationmark.triangle"
                     } else {
@@ -545,7 +561,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     install.isEnabled = !storageLoadFailed && (isInstalled
                         ? canUninstall(manualEntry)
                         : canInstall(manualEntry))
-                    install.contentTintColor = install.isEnabled ? .controlAccentColor : .disabledControlTextColor
+                    install.contentTintColor = install.isEnabled
+                        ? (isInstalled ? .systemOrange : .controlAccentColor) : .disabledControlTextColor
                     install.toolTip = isInstalled
                         ? "Desinstalar somente o pacote gerenciado. Configuração, histórico e credenciais locais serão preservados; isso não encerra a sessão."
                         : state.displayText
@@ -553,6 +570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         ? "Desinstalar Codex gerenciado de \(entry.displayName)"
                         : "Instalar Codex em \(entry.displayName)")
                     install.setAccessibilityValue(state.displayText)
+                    applyActionAppearance(install)
                     install.translatesAutoresizingMaskIntoConstraints = false
                     actions.insertArrangedSubview(install, at: 0)
                     install.widthAnchor.constraint(equalToConstant: 28).isActive = true

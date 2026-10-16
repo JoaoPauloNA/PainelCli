@@ -44,6 +44,17 @@ if "CLIDeviceCode" in installer or "NSPasteboard" in source or 'title: "Código"
 if 'open.standardError = FileHandle.nullDevice' not in installer:
     failures.append("authentication subprocess diagnostics could expose login flow output")
 
+# BUG-PC-ACTION-UI-001: presentation-only contract; functional guards above stay mandatory.
+for control in ["account", "remove", "install"]:
+    if f"applyActionAppearance({control})" not in source:
+        failures.append(f"{control} does not share the compact icon-only presentation")
+if "button.imagePosition = .imageOnly" not in source:
+    failures.append("shared action presentation does not enforce icons-only")
+if 'actionSymbol = "shippingbox"' not in row:
+    failures.append("uninstall is not visually distinct from removing a registration")
+if 'remove.setAccessibilityValue(remove.isEnabled ? "Disponível" : "Inativo")' not in source:
+    failures.append("disabled remove control can announce itself as available")
+
 if failures:
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
