@@ -374,31 +374,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 account.isBordered = false
                 account.contentTintColor = simulatedLoggedIn ? .systemOrange : .systemGreen
                 account.tag = index
+                let isManualEntry = entry.manualEntry != nil
                 let demoAction = simulatedLoggedIn ? "Deslogar" : "Logar"
-                account.toolTip = "\(demoAction) · simulação visual, sem autenticação real"
-                account.setAccessibilityLabel("\(demoAction) de \(entry.displayName), simulação visual")
-                account.setAccessibilityValue(simulatedLoggedIn ? "Logado em simulação" : "Deslogado em simulação")
+                account.isEnabled = isManualEntry
+                account.toolTip = isManualEntry
+                    ? "\(demoAction) · simulação visual, sem autenticação real"
+                    : "Login e logout indisponíveis para instalações detectadas"
+                account.setAccessibilityLabel(isManualEntry
+                    ? "\(demoAction) de \(entry.displayName), simulação visual"
+                    : "Login e logout indisponíveis para \(entry.displayName)")
+                account.setAccessibilityValue(isManualEntry
+                    ? (simulatedLoggedIn ? "Logado em simulação" : "Deslogado em simulação")
+                    : "Indisponível para instalação detectada")
                 account.translatesAutoresizingMaskIntoConstraints = false
                 actions.addArrangedSubview(account)
                 account.widthAnchor.constraint(equalToConstant: 28).isActive = true
                 account.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
-                // Automatic discoveries have no delete/hide control or deletion target.
-                if entry.manualEntry != nil {
-                    let remove = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
-                                          target: self, action: #selector(removeCLI(_:)))
-                    remove.bezelStyle = .inline
-                    remove.isBordered = false
-                    remove.contentTintColor = .systemRed
-                    remove.tag = index
-                    remove.isEnabled = !storageLoadFailed
-                    remove.toolTip = "Remover \(entry.displayName) da lista"
-                    remove.setAccessibilityLabel("Remover \(entry.displayName) da lista")
-                    remove.translatesAutoresizingMaskIntoConstraints = false
-                    actions.addArrangedSubview(remove)
-                    remove.widthAnchor.constraint(equalToConstant: 28).isActive = true
-                    remove.heightAnchor.constraint(equalToConstant: 28).isActive = true
-                }
+                let remove = NSButton(image: NSImage(systemSymbolName: "trash", accessibilityDescription: nil)!,
+                                      target: self, action: #selector(removeCLI(_:)))
+                remove.bezelStyle = .inline
+                remove.isBordered = false
+                remove.contentTintColor = .systemRed
+                remove.tag = index
+                remove.isEnabled = isManualEntry && !storageLoadFailed
+                remove.toolTip = isManualEntry
+                    ? "Remover \(entry.displayName) da lista"
+                    : "Instalações detectadas não podem ser removidas daqui"
+                remove.setAccessibilityLabel(isManualEntry
+                    ? "Remover \(entry.displayName) da lista"
+                    : "Remoção indisponível para instalação detectada \(entry.displayName)")
+                remove.setAccessibilityValue(isManualEntry ? "Disponível" : "Inativo")
+                remove.translatesAutoresizingMaskIntoConstraints = false
+                actions.addArrangedSubview(remove)
+                remove.widthAnchor.constraint(equalToConstant: 28).isActive = true
+                remove.heightAnchor.constraint(equalToConstant: 28).isActive = true
 
                 let installing = entry.manualEntry != nil && installingProviders.contains(entry.provider)
                 let canInstall = entry.manualEntry != nil && !installing && !statusText.hasPrefix("Instalada") && !statusText.hasPrefix("Encontrada")
@@ -502,15 +512,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let snapshot = try entryStore.snapshot(discoveries: detections)
             entries = snapshot.manualRegistrations
             automaticInstallations = snapshot.detectedInstallations
-            simulatedSessions.formIntersection(Set(listItems.map(\.id)))
+            simulatedSessions.formIntersection(Set(entries.map(\.id)))
         } catch {
             storageLoadFailed = true
         }
     }
 
     @objc private func toggleSimulatedSession(_ sender: NSButton) {
-        guard listItems.indices.contains(sender.tag) else { return }
-        let id = listItems[sender.tag].id
+        guard listItems.indices.contains(sender.tag),
+              let entry = listItems[sender.tag].manualEntry else { return }
+        let id = entry.id
         if !simulatedSessions.insert(id).inserted {
             simulatedSessions.remove(id)
         }
