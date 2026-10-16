@@ -332,6 +332,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return button
     }
 
+    private func makeInstallationProgress() -> NSView {
+        let slot = NSView()
+        slot.translatesAutoresizingMaskIntoConstraints = false
+        let progress = NSProgressIndicator()
+        progress.style = .spinning
+        progress.controlSize = .small
+        progress.isIndeterminate = true
+        progress.toolTip = "Instalação ou desinstalação em andamento"
+        progress.setAccessibilityLabel("Operação do pacote em andamento")
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        slot.addSubview(progress)
+        NSLayoutConstraint.activate([
+            slot.widthAnchor.constraint(equalToConstant: 28),
+            slot.heightAnchor.constraint(equalToConstant: 28),
+            progress.widthAnchor.constraint(equalToConstant: 16),
+            progress.heightAnchor.constraint(equalToConstant: 16),
+            progress.centerXAnchor.constraint(equalTo: slot.centerXAnchor),
+            progress.centerYAnchor.constraint(equalTo: slot.centerYAnchor)
+        ])
+        progress.startAnimation(nil)
+        return slot
+    }
+
     private func renderEntryList(in body: NSView) {
         let scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -582,6 +605,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     actions.insertArrangedSubview(install, at: 0)
                     install.widthAnchor.constraint(equalToConstant: 28).isActive = true
                     install.heightAnchor.constraint(equalToConstant: 28).isActive = true
+                    install.isHidden = state == .installing
+                    if state == .installing {
+                        actions.insertArrangedSubview(makeInstallationProgress(), at: 0)
+                    }
                 }
                 let separator = NSBox()
                 separator.boxType = .separator

@@ -92,6 +92,17 @@ if 'actionSymbol = "shippingbox"' not in row:
 if 'remove.setAccessibilityValue(remove.isEnabled ? "Disponível" : "Inativo")' not in source:
     failures.append("disabled remove control can announce itself as available")
 
+# BUG-PC-INSTALL-PROGRESS-001: loading must follow the existing operation state.
+for expected, message in [
+    ("install.isHidden = state == .installing", "busy installation still shows a static action icon"),
+    ("if state == .installing {", "loading presentation is not conditional on the existing installation state"),
+    ("makeInstallationProgress()", "busy installation has no native progress presentation"),
+]:
+    if expected not in row:
+        failures.append(message)
+if "progress.style = .spinning" not in source or "progress.startAnimation(nil)" not in source:
+    failures.append("native indeterminate installation spinner is missing")
+
 if failures:
     for failure in failures:
         print(f"FAIL: {failure}", file=sys.stderr)
