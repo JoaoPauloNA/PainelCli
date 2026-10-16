@@ -1,24 +1,24 @@
 # PainelCli
 
-PainelCli is an experimental native macOS AppKit app that discovers selected Codex CLI, Claude Code, Gemini CLI, and Antigravity executables and keeps a separate list of manual registrations. Discovery checks executable files in the running app's `PATH`, common macOS/user locations, the ChatGPT-bundled Codex path, and PainelCli's managed installation prefix. Antigravity is discovered through `agy` (including `~/.local/bin/agy`); it is discovery-only and is not added to the installable catalog. Discovery never runs a CLI or authenticates and is not a universal inventory.
+PainelCli is an experimental native macOS AppKit app that discovers Codex CLI, Claude Code, Gemini CLI, and Antigravity CLI while keeping a separate list of manual registrations. Discovery checks executable files in the running app's `PATH`, common macOS/user locations, the ChatGPT-bundled Codex path, and legacy PainelCli-managed paths. Antigravity uses the official `agy` executable; Gemini CLI remains a distinct detection target and is never relabeled as Antigravity. Discovery never runs a CLI or authenticates and is not a universal inventory.
 
 The compact list has two groups: **Instalações detectadas** displays unnumbered installation names, with visible but disabled account and trash controls and no active delete or hide actions; **Cadastros manuais** displays per-provider numbered registrations with a remove action. Automatic rows follow the current filesystem inventory and have stable identities per target/discovery path. Adding a catalog entry always creates a manual registration, even when an installation of the same provider is already visible. Removing a manual registration never suppresses an automatic discovery or uninstalls a CLI. Legacy automatic registrations and hidden-discovery metadata are migrated by the store snapshot API. Manual IDs and numbering are preserved.
 
-The installable catalog remains exactly CodexCLI, ClaudeCLI, and GeminiCLI. For manual registrations, the green/orange account controls remain an explicitly labeled, in-memory visual simulation; they do not indicate an authenticated account or run login/logout. The existing 56-point rows, inline icons, and native navigation materials are preserved.
+The manual-registration catalog is exactly CodexCLI, ClaudeCLI, and Antigravity CLI. Selecting a catalog item records metadata only. Installation and login are disabled for every registration until PainelCli can guarantee a separate executable environment, configuration, and account profile for each registration. No simulation is presented as an account state. Legacy GeminiCLI registrations migrate to Antigravity only when no real Gemini executable is detected and the original ordinal does not collide; otherwise they remain intact and the app asks for an explicit decision.
 
-**Status: development. No production version has been approved.** Version 0.0.0.20 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
+**Status: development. No production version has been approved.** Version 0.0.0.21 is the current development baseline. The `develop` branch contains the app; `main` contains production policy and remains without an approved app release. A production promotion requires passing technical checks and the project owner's explicit functional acceptance. Promotion happens through a pull request; CI does not tag, publish, or deploy a release.
 
 ## Build and test
 
 Requirements: macOS, Xcode Command Line Tools, Swift, and Python 3. Run `python3 scripts/build-open.py` to compile the app, keep the current and previous local bundles, and open the app. Run `scripts/ci-check.sh` to compile the AppKit executable and run the isolated store/installer test suite without opening the app. GitHub Actions runs the same check on macOS for pushes and pull requests to `main` and `develop`.
 
-The test suite uses temporary synthetic files and a simulated installer. It never runs `npm install` or installs a CLI.
+The test suite uses temporary synthetic executable files and verifies that installation is rejected before any filesystem write or process execution. It never runs a CLI, installer, login flow, or package manager.
 
 ## CLI installation limits
 
-Installing a CLI is an explicit action in the app. Node.js and npm must already be available. PainelCli uses a fixed package for each provider, the public npm registry, and a per-provider prefix under `~/Library/Application Support/PainelCli/Installations`. It does not install Node.js or npm, request administrator privileges, edit shell startup files, configure accounts, or pass arbitrary environment variables to npm. npm package lifecycle scripts run with the current user's permissions. The UI detects known executables and prevents an installation attempt when one is already found.
+Installation and account login are not implemented. The previous per-provider installation path shared one installation between registrations and therefore did not meet the isolation requirement; the old install runner and package plans have been removed. The backend now rejects install requests before runtime discovery or filesystem changes. No CLI files, global configuration, account profile, or credentials are created or changed by catalog registration.
 
-Gemini CLI's upstream project announced that individual free, Google AI Pro, and Google AI Ultra accounts stopped receiving service on 18 June 2026; Enterprise Gemini Code Assist and API-key access were reported as unaffected. Installing the npm package does not guarantee service access.
+The catalog no longer creates GeminiCLI registrations. Existing GeminiCLI registration metadata is migrated only under the safe conditions described above; the app does not read, copy, or alter Gemini or Antigravity credentials/configuration.
 
 ## Branches and production policy
 
@@ -32,8 +32,8 @@ See [LICENSE](LICENSE) for Apache License 2.0.
 
 ## Detected-row presentation
 
-Detected installations display only their unnumbered name, centered vertically, with no status subtitle. Discovery details remain available as a tooltip and accessibility help. Each detected target uses a distinct native SF Symbol: Codex — `chevron.left.forwardslash.chevron.right` (blue); Claude — `text.bubble` (orange); Gemini — `sparkles` (purple); Antigravity — `arrow.up.circle` (teal). These are system-provided identification cues, not official provider logos. No third-party brand asset is bundled or distributed. Source: https://developer.apple.com/sf-symbols/ . The existing account and trash controls remain visible but disabled for automatic detections; manual controls and numbering are preserved.
+Detected installations display only their unnumbered name, centered vertically, with no status subtitle. Discovery details remain available as a tooltip and accessibility help. Each detected target uses a distinct native SF Symbol: Codex — `chevron.left.forwardslash.chevron.right` (blue); Claude — `text.bubble` (orange); Gemini CLI — `sparkles` (purple); Antigravity CLI — `arrow.up.circle` (teal). These are system-provided identification cues, not official provider logos. No third-party brand asset is bundled or distributed. Source: https://developer.apple.com/sf-symbols/ . Account controls are disabled for all rows; automatic trash controls are disabled; manual registrations remain removable.
 
-Disabled account/trash controls use the semantic macOS disabled-control gray; enabled manual actions retain green/orange/red.
+Disabled account/install/trash controls use the semantic macOS disabled-control gray; manual removal remains enabled.
 
 Rows show two native symbols: CLI identity followed by origin (`desktopcomputer` for external discoveries; `app` for managed installations or manual registrations). Tooltips explicitly distinguish an app registration from a CLI actually installed by PainelCli. No installation or authentication is inferred from a manual record.

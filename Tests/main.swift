@@ -4,259 +4,218 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     if !condition() { fatalError(message) }
 }
 
+func createSyntheticExecutable(_ url: URL, contents: String = "synthetic executable") throws {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                            withIntermediateDirectories: true)
+    try Data(contents.utf8).write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+}
+
+func writeStoreDocument(_ store: CLIEntryStore, entries: [CLIEntry],
+                        highestOrdinals: [String: Int], hiddenDiscoveries: [String] = []) throws {
+    try FileManager.default.createDirectory(at: store.fileURL.deletingLastPathComponent(),
+                                            withIntermediateDirectories: true)
+    let serializedEntries: [[String: Any]] = entries.map { entry in
+        var value: [String: Any] = ["id": entry.id.uuidString,
+                                    "provider": entry.provider,
+                                    "ordinal": entry.ordinal,
+                                    "origin": entry.origin.rawValue]
+        if let detectedPath = entry.detectedPath { value["detectedPath"] = detectedPath }
+        return value
+    }
+    let document: [String: Any] = [
+        "entries": serializedEntries,
+        "highestOrdinals": highestOrdinals,
+        "hiddenDiscoveries": hiddenDiscoveries
+    ]
+    try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        .write(to: store.fileURL, options: .atomic)
+}
+
 let fileManager = FileManager.default
-let testRoot = fileManager.temporaryDirectory.appendingPathComponent("PainelCli-store-test-\(UUID().uuidString)", isDirectory: true)
-let store = CLIEntryStore(applicationSupportDirectory: testRoot)
+let testRoot = fileManager.temporaryDirectory
+    .appendingPathComponent("PainelCli-catalog-migration-test-\(UUID().uuidString)", isDirectory: true)
+try fileManager.createDirectory(at: testRoot, withIntermediateDirectories: true)
 defer { try? fileManager.removeItem(at: testRoot) }
 
-let first = try store.add(provider: "CodexCLI")
-require(first.count == 1 && first[0].displayName == "CodexCLI 1", "first entry/index")
-let second = try store.add(provider: "CodexCLI")
-require(second.count == 2 && second[0] == first[0] && second[1].displayName == "CodexCLI 2", "duplicate provider and stable index")
-let third = try store.add(provider: "ClaudeCLI")
-require(third.count == 3 && third[2].displayName == "ClaudeCLI 1", "independent provider index")
-require(Set(third.map(\.id)).count == 3, "unique entry IDs")
-let loaded = try store.load()
-require(loaded == third, "persistence reload")
+// The catalog is exact and does not conflate the real Gemini executable with Antigravity.
+require(CLIProvider.allCases.map(\.rawValue) == ["CodexCLI", "ClaudeCLI", "AntigravityCLI"],
+        "catalog contains Codex, Claude, and Antigravity only")
+require(CLIProvider.antigravity.catalogTitle == "Antigravity CLI" &&
+        CLIProvider.antigravity.executableName == "agy",
+        "Antigravity uses the official display name and executable")
+require(CLIDiscoveryTarget.gemini.executableName == "gemini" &&
+        CLIDiscoveryTarget.gemini.catalogProvider == nil &&
+        CLIDiscoveryTarget.antigravity.executableName == "agy",
+        "Gemini remains an independent detection target")
 
-let removed = try store.remove(id: second[1].id)
-require(removed.map(\.id) == [first[0].id, third[2].id], "remove one duplicate only")
-let afterRemoval = try store.add(provider: "CodexCLI")
-require(afterRemoval.last?.ordinal == 3, "provider numbering is not reused after removal")
-do {
-    _ = try store.remove(id: UUID())
-    fatalError("removing an unknown entry should fail")
-} catch CLIEntryStore.StoreError.entryNotFound {
-} catch {
-    fatalError("unknown entry should have a specific store error")
-}
+// Manual registration duplicates have stable IDs and separate provider ordinals.
+let store = CLIEntryStore(applicationSupportDirectory: testRoot)
+let codex1 = try store.add(provider: .codex)[0]
+let codex2 = try store.add(provider: .codex).last!
+let claude1 = try store.add(provider: .claude).last!
+require(codex1.displayName == "CodexCLI 1" && codex2.displayName == "CodexCLI 2" &&
+        claude1.displayName == "ClaudeCLI 1", "manual numbering remains provider-scoped")
+let antigravity1 = try store.add(provider: .antigravity).last!
+require(antigravity1.displayName == "Antigravity CLI 1", "catalog rows use the official Antigravity name")
+let persistedRegistrations = try store.load()
+require(persistedRegistrations.count == 4, "manual registrations persist")
+let removedCodex = try store.remove(id: codex2.id)
+require(!removedCodex.contains(where: { $0.id == codex2.id }), "manual row removal remains functional")
+let nextCodex = try store.add(provider: .codex).last
+require(nextCodex?.ordinal == 3,
+        "manual ordinals are not reused after removal")
 
-let legacyRoot = testRoot.appendingPathComponent("legacy", isDirectory: true)
-let legacyStore = CLIEntryStore(applicationSupportDirectory: legacyRoot)
-try fileManager.createDirectory(at: legacyStore.fileURL.deletingLastPathComponent(),
-                                withIntermediateDirectories: true)
-let legacyID = UUID()
-let legacyArray = "[{\"id\":\"\(legacyID.uuidString)\",\"provider\":\"CodexCLI\",\"ordinal\":2}]"
-try Data(legacyArray.utf8).write(to: legacyStore.fileURL)
-let legacyEntries = try legacyStore.load()
-require(legacyEntries.count == 1 && legacyEntries[0].id == legacyID && legacyEntries[0].origin == .manual,
-        "legacy entry array remains readable and defaults to manual")
-let migrated = try legacyStore.add(provider: "CodexCLI")
-require(migrated.last?.ordinal == 3, "legacy entries migrate with numbering intact")
-
-let legacyDocumentStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("legacy-document"))
-try fileManager.createDirectory(at: legacyDocumentStore.fileURL.deletingLastPathComponent(),
-                                withIntermediateDirectories: true)
-let legacyDocument = """
-{"entries":[{"id":"\(UUID().uuidString)","provider":"ClaudeCLI","ordinal":4}],"highestOrdinals":{"ClaudeCLI":4}}
-"""
-try Data(legacyDocument.utf8).write(to: legacyDocumentStore.fileURL)
-let migratedDocument = try legacyDocumentStore.add(provider: "ClaudeCLI")
-require(migratedDocument.last?.ordinal == 5 && migratedDocument.last?.origin == .manual,
-        "prior document format migrates with ordinals and defaults intact")
-
-final class SimulatedRunner: CLICommandRunning {
-    let expectedProvider: CLIProvider
-    let expectedExecutable: URL
-    let expectedInstallDirectory: URL
-    let fileManager: FileManager
-    private(set) var calls = 0
-
-    init(provider: CLIProvider, executable: URL, installDirectory: URL, fileManager: FileManager) {
-        expectedProvider = provider
-        expectedExecutable = executable
-        expectedInstallDirectory = installDirectory
-        self.fileManager = fileManager
+// Registration installs are hard-blocked before any path creation or process operation.
+let isolationRoot = testRoot.appendingPathComponent("isolation-block", isDirectory: true)
+let blockedService = CLIInstallService(applicationSupportDirectory: isolationRoot,
+                                       environment: ["PATH": ""],
+                                       homeDirectory: testRoot,
+                                       additionalSearchDirectories: [],
+                                       knownExecutableOverrides: [:])
+for provider in CLIProvider.allCases {
+    let entry = CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: 1)
+    do {
+        try blockedService.install(entry: entry)
+        fatalError("installation must remain blocked until per-registration isolation exists")
+    } catch CLIInstallError.isolatedInstallationUnavailable {
     }
-
-    func run(executable: URL, arguments: [String], environment: [String: String]) throws {
-        calls += 1
-        let plan = CLIInstallPlan(provider: expectedProvider, npmURL: expectedExecutable,
-                                  installDirectory: expectedInstallDirectory)
-        require(executable == expectedExecutable, "uses resolved npm executable")
-        require(arguments == plan.arguments, "fixed install package and arguments")
-        require(environment["npm_config_registry"] == "https://registry.npmjs.org/", "public npm registry")
-        require(environment["npm_config_userconfig"] == expectedInstallDirectory.appendingPathComponent(".npmrc").path,
-                "isolated npm user config")
-        require(environment["PATH"]?.contains(expectedExecutable.deletingLastPathComponent().path) == true,
-                "controlled npm runtime path")
-        require(environment["NPM_TOKEN"] == nil && environment["ANTHROPIC_API_KEY"] == nil,
-                "secrets are not passed to npm")
-        let executableOutput = expectedInstallDirectory.appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent(expectedProvider.executableName)
-        try fileManager.createDirectory(at: executableOutput.deletingLastPathComponent(),
-                                        withIntermediateDirectories: true)
-        try Data("synthetic executable".utf8).write(to: executableOutput)
-        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executableOutput.path)
-    }
+    require(!fileManager.fileExists(atPath: blockedService.installationDirectory(
+        for: CLIDiscoveryTarget(rawValue: provider.rawValue)!).path),
+        "blocked install does not create a shared provider directory")
 }
+require(!fileManager.fileExists(atPath: isolationRoot.path),
+        "blocked install performs no filesystem writes")
 
-let runtimeDirectory = testRoot.appendingPathComponent("runtime", isDirectory: true)
-try fileManager.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true)
-let fakeNode = runtimeDirectory.appendingPathComponent("node")
-let fakeNpm = runtimeDirectory.appendingPathComponent("npm")
-for runtime in [fakeNode, fakeNpm] {
-    try Data("synthetic runtime".utf8).write(to: runtime)
-    try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.path)
-}
-let installRoot = testRoot.appendingPathComponent("installer", isDirectory: true)
-let provider = CLIProvider.claude
-let installDirectory = installRoot.appendingPathComponent("PainelCli/Installations/\(provider.rawValue)",
-                                                          isDirectory: true)
-let runner = SimulatedRunner(provider: provider, executable: fakeNpm,
-                             installDirectory: installDirectory, fileManager: fileManager)
-let installer = CLIInstallService(applicationSupportDirectory: installRoot,
-                                  fileManager: fileManager, runner: runner,
-                                  environment: ["PATH": runtimeDirectory.path, "HOME": testRoot.path,
-                                                "NPM_TOKEN": "synthetic-secret", "ANTHROPIC_API_KEY": "synthetic-secret"],
-                                  homeDirectory: testRoot, additionalSearchDirectories: [],
-                                  knownExecutableOverrides: [:])
-try installer.install(provider: provider)
-require(runner.calls == 1, "single simulated installer invocation")
-require(installer.installedExecutable(for: provider)?.lastPathComponent == "claude",
-        "installed state requires expected executable")
-do {
-    try installer.install(provider: provider)
-    fatalError("existing installation must not be overwritten")
-} catch CLIInstallError.alreadyInstalled {
-} catch {
-    fatalError("existing installation is distinguished")
-}
-require(runner.calls == 1, "detected install prevents repeated invocation")
-
-let plan = CLIInstallPlan(provider: .gemini, npmURL: fakeNpm,
-                          installDirectory: testRoot.appendingPathComponent("gemini"))
-require(plan.arguments.last == "@google/gemini-cli", "Gemini uses official fixed package")
-require(CLIInstallPlan(provider: .codex, npmURL: fakeNpm,
-                       installDirectory: testRoot.appendingPathComponent("codex")).arguments.last == "@openai/codex",
-        "Codex uses official fixed package")
-
-func createSyntheticExecutable(_ url: URL) throws {
-    try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try Data("synthetic executable".utf8).write(to: url)
-    try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-}
-
+// Synthetic executable files prove detection is path-only and preserves true CLI identity.
 let discoveryHome = testRoot.appendingPathComponent("discovery-home", isDirectory: true)
-let syntheticClaude = discoveryHome.appendingPathComponent(".local/bin/claude")
-let syntheticClaudeTarget = discoveryHome.appendingPathComponent(".local/share/claude/versions/2.1.test")
-let syntheticAntigravity = discoveryHome.appendingPathComponent(".local/bin/agy")
-let syntheticBundledCodex = testRoot.appendingPathComponent("ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+let localBin = discoveryHome.appendingPathComponent(".local/bin", isDirectory: true)
+let syntheticClaude = localBin.appendingPathComponent("claude")
+let syntheticClaudeTarget = discoveryHome.appendingPathComponent(".local/share/claude/versions/test")
+let syntheticAntigravity = localBin.appendingPathComponent("agy")
+let syntheticGemini = localBin.appendingPathComponent("gemini")
+let syntheticCodex = testRoot.appendingPathComponent(
+    "ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+let shouldNotRunMarker = testRoot.appendingPathComponent("cli-execution-marker")
 try createSyntheticExecutable(syntheticClaudeTarget)
-try fileManager.createDirectory(at: syntheticClaude.deletingLastPathComponent(), withIntermediateDirectories: true)
+try fileManager.createDirectory(at: localBin, withIntermediateDirectories: true)
 try fileManager.createSymbolicLink(at: syntheticClaude, withDestinationURL: syntheticClaudeTarget)
-try createSyntheticExecutable(syntheticAntigravity)
-try createSyntheticExecutable(syntheticBundledCodex)
+try createSyntheticExecutable(syntheticAntigravity,
+                              contents: "#!/bin/sh\ntouch \(shouldNotRunMarker.path)\n")
+try createSyntheticExecutable(syntheticGemini)
+try createSyntheticExecutable(syntheticCodex)
 let discoveryService = CLIInstallService(
     applicationSupportDirectory: testRoot.appendingPathComponent("discovery-support"),
-    fileManager: fileManager,
-    environment: ["PATH": "", "HOME": discoveryHome.path],
+    environment: ["PATH": localBin.path],
     homeDirectory: discoveryHome,
-    knownExecutableOverrides: [.codex: [syntheticBundledCodex]])
-let discovered = discoveryService.detectedExecutables()
-require(Set(discovered.map(\.provider)) == [.codex, .claude], "detect PATH/home and known ChatGPT executable without running it")
-require(discovered.first(where: { $0.provider == .codex })?.executableURL.path == syntheticBundledCodex.path,
-        "known bundled Codex location is reported")
-require(discovered.first(where: { $0.provider == .claude })?.executableURL.path == syntheticClaudeTarget.path &&
-        discovered.first(where: { $0.provider == .claude })?.discoveryURL.path == syntheticClaude.path,
-        "symlink target is inspected while the stable user-facing path is retained")
-require(discovered.allSatisfy { !$0.isManaged }, "external discoveries remain distinct from app-managed installs")
+    additionalSearchDirectories: [],
+    knownExecutableOverrides: [.codex: [syntheticCodex]])
+let discoveries = discoveryService.detectedInstallations()
+require(Set(discoveries.map(\.target)) == Set(CLIDiscoveryTarget.allCases),
+        "Codex, Claude, Gemini and Antigravity are detected distinctly")
+require(discoveries.first(where: { $0.target == .antigravity })?.discoveryURL == syntheticAntigravity,
+        "agy is identified only as Antigravity CLI")
+require(discoveries.first(where: { $0.target == .gemini })?.discoveryURL == syntheticGemini,
+        "gemini remains identified as Gemini CLI")
+require(discoveries.first(where: { $0.target == .claude })?.executableURL == syntheticClaudeTarget &&
+        discoveries.first(where: { $0.target == .claude })?.discoveryURL == syntheticClaude,
+        "symlink discovery preserves executable target and stable alias")
+require(!fileManager.fileExists(atPath: shouldNotRunMarker.path),
+        "discovery never executes a synthetic CLI")
 
-let discoveredInstallations = discoveryService.detectedInstallations()
-let agy = discoveredInstallations.first(where: { $0.target == .antigravity })
-require(agy?.discoveryURL.path == syntheticAntigravity.path && agy?.displayName == "Antigravity",
-        "agy is discovered as an uninstalled-catalog Antigravity target")
-require(CLIProvider.allCases.map(\.rawValue) == ["CodexCLI", "ClaudeCLI", "GeminiCLI"],
-        "Antigravity remains outside the installable catalog")
+// Catalog-origin Gemini registrations migrate only when no actual Gemini is detected and
+// the original ordinal can be kept without collision. IDs, ordinals, and high-water survive.
+let legacyMigrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("legacy-migration"))
+let legacyGeminiID = UUID()
+let oldCodexID = UUID()
+try writeStoreDocument(legacyMigrationStore, entries: [
+    CLIEntry(id: legacyGeminiID, provider: "GeminiCLI", ordinal: 2),
+    CLIEntry(id: oldCodexID, provider: "CodexCLI", ordinal: 1)
+], highestOrdinals: ["GeminiCLI": 4, "CodexCLI": 1],
+   hiddenDiscoveries: [syntheticGemini.path])
+let noRealGemini = discoveries.filter { $0.target != .gemini }
+let migratedSnapshot = try legacyMigrationStore.snapshot(discoveries: noRealGemini)
+let migratedGemini = migratedSnapshot.manualRegistrations.first(where: { $0.id == legacyGeminiID })
+require(migratedGemini?.provider == CLIProvider.antigravity.rawValue &&
+        migratedGemini?.ordinal == 2 && migratedGemini?.displayName == "Antigravity CLI 2",
+        "unambiguous catalog registration changes label while preserving ID and ordinal")
+require(migratedSnapshot.migrationNotice?.contains("IDs e ordinais foram preservados") == true &&
+        migratedSnapshot.manualRegistrations.first(where: { $0.id == oldCodexID })?.provider == "CodexCLI",
+        "successful migration is reported and other registrations remain intact")
+let migratedAdded = try legacyMigrationStore.add(provider: .antigravity).last!
+require(migratedAdded.ordinal == 5,
+        "legacy high-water prevents reusing an old automatic or manual index")
+let migratedDocumentText = try String(contentsOf: legacyMigrationStore.fileURL, encoding: .utf8)
+require(!migratedDocumentText.contains("hiddenDiscoveries"), "legacy hidden state is removed")
 
-let reconciliationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("reconciliation"))
-let manualCodex = try reconciliationStore.add(provider: CLIProvider.codex.rawValue)[0]
-let firstSnapshot = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
-require(firstSnapshot.manualRegistrations == [manualCodex], "manual registration remains independent")
-require(firstSnapshot.detectedInstallations.count == 3,
-        "automatic installations are always present alongside a manual registration")
-require(firstSnapshot.detectedInstallations.map(\.target).contains(.codex) &&
-        firstSnapshot.detectedInstallations.map(\.target).contains(.antigravity),
-        "detections are represented separately from manual registrations")
-let stableSnapshot = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
-require(stableSnapshot.detectedInstallations == firstSnapshot.detectedInstallations,
-        "repeated discovery keeps automatic IDs stable and has no ordinal field")
-let automaticID = firstSnapshot.detectedInstallations.first(where: { $0.target == .claude })!.id
+// A real Gemini executable blocks conversion and leaves the complete legacy record intact.
+let preserveLegacyStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("preserve-gemini"))
+let preserveGeminiID = UUID()
+try writeStoreDocument(preserveLegacyStore,
+                       entries: [CLIEntry(id: preserveGeminiID, provider: "GeminiCLI", ordinal: 1)],
+                       highestOrdinals: ["GeminiCLI": 1])
+let preserveSnapshot = try preserveLegacyStore.snapshot(discoveries: discoveries)
+require(preserveSnapshot.manualRegistrations.first?.id == preserveGeminiID &&
+        preserveSnapshot.manualRegistrations.first?.provider == "GeminiCLI" &&
+        preserveSnapshot.manualRegistrations.first?.ordinal == 1,
+        "real Gemini detection preserves the legacy registration exactly")
+require(preserveSnapshot.detectedInstallations.contains(where: { $0.target == .gemini }) &&
+        preserveSnapshot.migrationNotice != nil,
+        "actual Gemini remains detected and asks for an explicit migration decision")
+
+// Existing Antigravity index collision also preserves all legacy rows, rather than renumbering.
+let collisionStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("ordinal-collision"))
+let collidingGeminiID = UUID()
+let existingAntigravityID = UUID()
+try writeStoreDocument(collisionStore, entries: [
+    CLIEntry(id: collidingGeminiID, provider: "GeminiCLI", ordinal: 1),
+    CLIEntry(id: existingAntigravityID, provider: CLIProvider.antigravity.rawValue, ordinal: 1)
+], highestOrdinals: ["GeminiCLI": 1, CLIProvider.antigravity.rawValue: 1])
+let collisionSnapshot = try collisionStore.snapshot(discoveries: noRealGemini)
+require(collisionSnapshot.manualRegistrations.contains(where: {
+    $0.id == collidingGeminiID && $0.provider == "GeminiCLI" && $0.ordinal == 1
+}) && collisionSnapshot.migrationNotice != nil,
+        "ordinal collision keeps the legacy provider and asks for a decision")
+let nextAfterCollision = try collisionStore.add(provider: .antigravity).last
+require(nextAfterCollision?.ordinal == 2,
+        "future Antigravity registration avoids ordinal collision")
+
+// Historical automatic Gemini rows migrate into their own discovery identity, never AGY.
+let automaticMigrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("automatic-gemini"))
+let automaticGeminiID = UUID()
+try writeStoreDocument(automaticMigrationStore, entries: [
+    CLIEntry(id: automaticGeminiID, provider: "GeminiCLI", ordinal: 1,
+             origin: .automatic, detectedPath: syntheticGemini.path)
+], highestOrdinals: ["GeminiCLI": 1])
+let automaticMigrated = try automaticMigrationStore.snapshot(discoveries: discoveries)
+require(automaticMigrated.detectedInstallations.first(where: { $0.target == .gemini })?.id == automaticGeminiID,
+        "old automatic Gemini identity remains attached to the gemini executable")
+require(!automaticMigrated.manualRegistrations.contains(where: { $0.id == automaticGeminiID }),
+        "automatic Gemini detection never becomes an Antigravity manual registration")
+
+// Legacy arrays and corrupt-file preservation remain supported.
+let legacyArrayStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("legacy-array"))
+try fileManager.createDirectory(at: legacyArrayStore.fileURL.deletingLastPathComponent(),
+                                 withIntermediateDirectories: true)
+let legacyArrayID = UUID()
+let legacyArray = "[{\"id\":\"\(legacyArrayID.uuidString)\",\"provider\":\"CodexCLI\",\"ordinal\":2}]"
+try Data(legacyArray.utf8).write(to: legacyArrayStore.fileURL)
+let legacyArrayEntries = try legacyArrayStore.load()
+require(legacyArrayEntries.first?.id == legacyArrayID,
+        "legacy JSON-array registration remains readable")
+
+let corruptStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("corrupt"))
+try fileManager.createDirectory(at: corruptStore.fileURL.deletingLastPathComponent(),
+                                 withIntermediateDirectories: true)
+try Data("not-json".utf8).write(to: corruptStore.fileURL)
+let corruptBytes = try Data(contentsOf: corruptStore.fileURL)
 do {
-    _ = try reconciliationStore.remove(id: automaticID)
-    fatalError("automatic installations cannot be removed as registrations")
-} catch CLIEntryStore.StoreError.entryNotFound {
-}
-let manualClaude = try reconciliationStore.add(provider: CLIProvider.claude.rawValue).last!
-require(manualClaude.ordinal == 1, "manual registration starts its own ordinal sequence")
-let snapshotWithDuplicates = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
-require(snapshotWithDuplicates.manualRegistrations.map(\.provider) == ["CodexCLI", "ClaudeCLI"],
-        "manual registrations can duplicate providers independently from detections")
-require(snapshotWithDuplicates.detectedInstallations == firstSnapshot.detectedInstallations,
-        "adding a manual registration never promotes or hides a detection")
-_ = try reconciliationStore.remove(id: manualClaude.id,
-                                   suppressingDiscoveryPaths: [syntheticClaude.path])
-let afterManualRemoval = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
-require(afterManualRemoval.detectedInstallations == firstSnapshot.detectedInstallations,
-        "removing a manual registration cannot suppress automatic discovery")
-let afterUninstall = try reconciliationStore.snapshot(discoveries: [])
-require(afterUninstall.detectedInstallations.isEmpty && afterUninstall.manualRegistrations == [manualCodex],
-        "automatic presentation follows current disk state and disappears after uninstall")
-let rediscovered = try reconciliationStore.snapshot(discoveries: discoveredInstallations)
-require(rediscovered.detectedInstallations == firstSnapshot.detectedInstallations,
-        "a rediscovered executable regains the same stable identity")
-
-let migrationStore = CLIEntryStore(applicationSupportDirectory: testRoot.appendingPathComponent("migration"))
-try fileManager.createDirectory(at: migrationStore.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-let migratedManualID = UUID()
-let migratedAutomaticID = UUID()
-let migrationJSON = """
-{"entries":[{"id":"\(migratedManualID.uuidString)","provider":"ClaudeCLI","ordinal":2},{"id":"\(migratedAutomaticID.uuidString)","provider":"ClaudeCLI","ordinal":3,"origin":"automatic","detectedPath":"\(syntheticClaude.path)"}],"highestOrdinals":{"ClaudeCLI":3},"hiddenDiscoveries":["\(syntheticClaude.path)"]}
-"""
-try Data(migrationJSON.utf8).write(to: migrationStore.fileURL)
-let migratedSnapshot = try migrationStore.snapshot(discoveries: discoveredInstallations)
-require(migratedSnapshot.manualRegistrations.count == 1 &&
-        migratedSnapshot.manualRegistrations[0].id == migratedManualID &&
-        migratedSnapshot.manualRegistrations[0].ordinal == 2,
-        "legacy automatic records are removed while manual IDs and ordinals survive")
-require(migratedSnapshot.detectedInstallations.first(where: { $0.target == .claude })?.id == migratedAutomaticID,
-        "legacy automatic identity migrates into the detection identity map")
-let migratedBytes = try String(contentsOf: migrationStore.fileURL, encoding: .utf8)
-require(!migratedBytes.contains("hiddenDiscoveries") && !migratedBytes.contains("automatic\""),
-        "legacy hide state and automatic rows are cleared from persistence")
-let afterMigrationAdd = try migrationStore.add(provider: "ClaudeCLI")
-require(afterMigrationAdd.last?.ordinal == 4,
-        "legacy high-water value is retained to avoid reusing a previously issued number")
-
-func XCTUnwrapForTests<T>(_ value: T?, _ message: String) throws -> T {
-    guard let value else { fatalError(message) }
-    return value
-}
-
-func tryOptionalEmpty(_ entries: [CLIEntry], provider: CLIProvider) -> Bool {
-    entries.filter { $0.provider == provider.rawValue }.count == 1
-}
-
-try Data("not-json".utf8).write(to: store.fileURL, options: .atomic)
-let corruptBytes = try Data(contentsOf: store.fileURL)
-do {
-    _ = try store.add(provider: "CodexCLI")
-    fatalError("corrupt file should block add")
-} catch CLIEntryStore.StoreError.invalidEntries {
-    fatalError("decode errors should retain their original decoding error")
+    _ = try corruptStore.snapshot(discoveries: [])
+    fatalError("corrupt store must not be replaced")
 } catch {
-    let bytesAfterFailedAdd = try Data(contentsOf: store.fileURL)
-    require(bytesAfterFailedAdd == corruptBytes, "corrupt file is preserved")
+    let bytesAfterFailedMigration = try Data(contentsOf: corruptStore.fileURL)
+    require(bytesAfterFailedMigration == corruptBytes,
+            "failed migration preserves the original file")
 }
 
-let blocker = testRoot.appendingPathComponent("file-blocker")
-try Data("block".utf8).write(to: blocker)
-let failingStore = CLIEntryStore(applicationSupportDirectory: blocker)
-do {
-    _ = try failingStore.add(provider: "GeminiCLI")
-    fatalError("unwritable target should fail")
-} catch {
-    require(!fileManager.fileExists(atPath: failingStore.fileURL.path), "failed write does not report persisted entry")
-}
-
-print("CLIEntryStore and simulated installer tests passed")
+print("CLI catalog migration, discovery, and isolation-block tests passed")

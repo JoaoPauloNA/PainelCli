@@ -1,15 +1,19 @@
 import Foundation
 
-enum CLIProvider: String, CaseIterable {
+/// Providers offered for manual registration. Installation and account login remain
+/// unavailable until each registration can own an isolated installation and profile.
+enum CLIProvider: String, CaseIterable, Identifiable {
     case codex = "CodexCLI"
     case claude = "ClaudeCLI"
-    case gemini = "GeminiCLI"
+    case antigravity = "AntigravityCLI"
 
-    var npmPackage: String {
+    var id: String { rawValue }
+
+    var catalogTitle: String {
         switch self {
-        case .codex: return "@openai/codex"
-        case .claude: return "@anthropic-ai/claude-code"
-        case .gemini: return "@google/gemini-cli"
+        case .codex: return "CodexCLI"
+        case .claude: return "ClaudeCLI"
+        case .antigravity: return "Antigravity CLI"
         }
     }
 
@@ -17,13 +21,13 @@ enum CLIProvider: String, CaseIterable {
         switch self {
         case .codex: return "codex"
         case .claude: return "claude"
-        case .gemini: return "gemini"
+        case .antigravity: return "agy"
         }
     }
 }
 
-/// Targets visible in automatic discovery. Antigravity is intentionally discovery-only;
-/// adding it here does not make it an installable catalog provider.
+/// The automatic inventory intentionally retains Gemini CLI as a separate real target,
+/// even though Gemini is no longer offered for new manual registrations.
 enum CLIDiscoveryTarget: String, Codable, CaseIterable, Hashable {
     case codex = "CodexCLI"
     case claude = "ClaudeCLI"
@@ -32,10 +36,10 @@ enum CLIDiscoveryTarget: String, Codable, CaseIterable, Hashable {
 
     var displayName: String {
         switch self {
-        case .codex: return "Codex"
-        case .claude: return "Claude"
-        case .gemini: return "Gemini"
-        case .antigravity: return "Antigravity"
+        case .codex: return "CodexCLI"
+        case .claude: return "ClaudeCLI"
+        case .gemini: return "Gemini CLI"
+        case .antigravity: return "Antigravity CLI"
         }
     }
 
@@ -48,65 +52,24 @@ enum CLIDiscoveryTarget: String, Codable, CaseIterable, Hashable {
         }
     }
 
-    var installableProvider: CLIProvider? { CLIProvider(rawValue: rawValue) }
+    var catalogProvider: CLIProvider? {
+        switch self {
+        case .codex: return .codex
+        case .claude: return .claude
+        case .gemini: return nil
+        case .antigravity: return .antigravity
+        }
+    }
 
     init?(legacyProviderName: String) {
         switch legacyProviderName {
-        case CLIProvider.codex.rawValue: self = .codex
-        case CLIProvider.claude.rawValue: self = .claude
-        case CLIProvider.gemini.rawValue: self = .gemini
+        case "CodexCLI": self = .codex
+        case "ClaudeCLI": self = .claude
+        case "GeminiCLI": self = .gemini
+        case "AntigravityCLI": self = .antigravity
         default: return nil
         }
     }
-}
-
-struct CLIInstallPlan: Equatable {
-    let provider: CLIProvider
-    let npmURL: URL
-    let installDirectory: URL
-
-    var arguments: [String] {
-        ["install", "--global", "--prefix", installDirectory.path,
-         "--registry=https://registry.npmjs.org/",
-         "--userconfig=\(installDirectory.appendingPathComponent(".npmrc").path)",
-         "--cache=\(installDirectory.appendingPathComponent("npm-cache", isDirectory: true).path)",
-         "--no-audit", "--no-fund", "--logs-max=0", "--loglevel=error", provider.npmPackage]
-    }
-
-    var executableURL: URL { npmURL }
-}
-
-protocol CLICommandRunning {
-    func run(executable: URL, arguments: [String], environment: [String: String]) throws
-}
-
-struct FoundationCLICommandRunner: CLICommandRunning {
-    func run(executable: URL, arguments: [String], environment: [String: String]) throws {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.environment = environment
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-            throw CLIInstallError.commandFailed
-        }
-    }
-}
-
-enum CLIInstallError: Error {
-    case runtimeMissing
-    case alreadyInstalled(String)
-    case commandFailed
-}
-
-struct CLIDetection: Equatable {
-    let provider: CLIProvider
-    let executableURL: URL
-    let discoveryURL: URL
-    let isManaged: Bool
 }
 
 struct CLIDiscovery: Equatable {
@@ -118,27 +81,32 @@ struct CLIDiscovery: Equatable {
     var displayName: String { target.displayName }
 }
 
+enum CLIInstallError: Error, Equatable, LocalizedError {
+    case isolatedInstallationUnavailable
+
+    var errorDescription: String? {
+        "Instalação bloqueada até que cada cadastro tenha diretório e perfil isolados."
+    }
+}
+
 struct CLIInstallService {
     private let fileManager: FileManager
     private let supportDirectory: URL
-    private let runner: CLICommandRunning
     private let environment: [String: String]
     private let homeDirectory: URL
     private let additionalSearchDirectories: [URL]?
-    private let knownExecutableOverrides: [CLIProvider: [URL]]?
+    private let knownExecutableOverrides: [CLIDiscoveryTarget: [URL]]?
 
     init(applicationSupportDirectory: URL,
          fileManager: FileManager = .default,
-         runner: CLICommandRunning = FoundationCLICommandRunner(),
          environment: [String: String] = ProcessInfo.processInfo.environment,
          homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true),
          additionalSearchDirectories: [URL]? = nil,
-         knownExecutableOverrides: [CLIProvider: [URL]]? = nil) {
+         knownExecutableOverrides: [CLIDiscoveryTarget: [URL]]? = nil) {
         self.fileManager = fileManager
         self.supportDirectory = applicationSupportDirectory
             .appendingPathComponent("PainelCli", isDirectory: true)
             .appendingPathComponent("Installations", isDirectory: true)
-        self.runner = runner
         self.environment = environment
         self.homeDirectory = homeDirectory
         self.additionalSearchDirectories = additionalSearchDirectories
@@ -153,32 +121,25 @@ struct CLIInstallService {
         return CLIInstallService(applicationSupportDirectory: supportDirectory)
     }
 
-    func installedExecutable(for provider: CLIProvider) -> URL? {
-        detectedExecutables(for: provider).first?.executableURL
+    /// The current backend does not support per-registration isolation, so installation is
+    /// a hard failure before filesystem writes, runtime discovery, or process execution.
+    func install(entry: CLIEntry) throws {
+        _ = entry
+        throw CLIInstallError.isolatedInstallationUnavailable
     }
 
-    func detectedExecutables() -> [CLIDetection] {
-        CLIProvider.allCases.flatMap(detectedExecutables(for:))
-    }
-
-    /// File-system-only inventory across installable CLIs and discovery-only targets.
-    /// This does not invoke an executable, authenticate, or alter a catalog entry.
+    /// Inspects executable bits and paths only. No discovered CLI is invoked or authenticated.
     func detectedInstallations() -> [CLIDiscovery] {
-        let installable = detectedExecutables().map { detection in
-            CLIDiscovery(target: CLIDiscoveryTarget(rawValue: detection.provider.rawValue)!,
-                         executableURL: detection.executableURL,
-                         discoveryURL: detection.discoveryURL,
-                         isManaged: detection.isManaged)
-        }
-        return installable + detectedAntigravityExecutables()
+        CLIDiscoveryTarget.allCases.flatMap(detectedInstallations(for:))
     }
 
-    func detectedExecutables(for provider: CLIProvider) -> [CLIDetection] {
-        let managed = installDirectory(for: provider).appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent(provider.executableName, isDirectory: false)
+    func detectedInstallations(for target: CLIDiscoveryTarget) -> [CLIDiscovery] {
+        let managed = installationDirectory(for: target)
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent(target.executableName, isDirectory: false)
         var candidates = [managed]
-        candidates += searchDirectories().map { $0.appendingPathComponent(provider.executableName) }
-        candidates += knownExecutables(for: provider)
+        candidates += searchDirectories().map { $0.appendingPathComponent(target.executableName) }
+        candidates += knownExecutables(for: target)
 
         var seen = Set<String>()
         return candidates.compactMap { candidate in
@@ -186,70 +147,24 @@ struct CLIInstallService {
             let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
             guard seen.insert(resolved.path).inserted else { return nil }
             let managedPath = managed.resolvingSymlinksInPath().standardizedFileURL.path
-            return CLIDetection(provider: provider, executableURL: resolved,
+            return CLIDiscovery(target: target, executableURL: resolved,
                                 discoveryURL: candidate.standardizedFileURL,
                                 isManaged: resolved.path == managedPath)
         }
     }
 
-    func install(provider: CLIProvider) throws {
-        if let found = installedExecutable(for: provider) {
-            let managed = installDirectory(for: provider).appendingPathComponent("bin", isDirectory: true)
-                .appendingPathComponent(provider.executableName)
-            if found.standardizedFileURL != managed.standardizedFileURL {
-                throw CLIInstallError.alreadyInstalled(found.path)
-            }
-            throw CLIInstallError.alreadyInstalled(found.path)
-        }
-        guard let npmURL = discoverExecutable(named: "npm"),
-              discoverExecutable(named: "node") != nil else {
-            throw CLIInstallError.runtimeMissing
-        }
-
-        let directory = installDirectory(for: provider)
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        let emptyUserConfig = directory.appendingPathComponent(".npmrc")
-        try Data().write(to: emptyUserConfig, options: .atomic)
-        let plan = CLIInstallPlan(provider: provider, npmURL: npmURL, installDirectory: directory)
-        let processEnvironment = sanitizedEnvironment(npmDirectory: npmURL.deletingLastPathComponent(),
-                                                     cacheDirectory: directory.appendingPathComponent("npm-cache", isDirectory: true),
-                                                     userConfig: emptyUserConfig)
-        try runner.run(executable: plan.executableURL, arguments: plan.arguments,
-                       environment: processEnvironment)
-        let executable = directory.appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent(provider.executableName, isDirectory: false)
-        guard fileManager.isExecutableFile(atPath: executable.path) else {
-            throw CLIInstallError.commandFailed
-        }
+    func installationDirectory(for target: CLIDiscoveryTarget) -> URL {
+        supportDirectory.appendingPathComponent(target.rawValue, isDirectory: true)
     }
 
-    func installDirectory(for provider: CLIProvider) -> URL {
-        supportDirectory.appendingPathComponent(provider.rawValue, isDirectory: true)
-    }
-
-    private func knownExecutables(for provider: CLIProvider) -> [URL] {
-        if let knownExecutableOverrides { return knownExecutableOverrides[provider] ?? [] }
-        guard provider == .codex else { return [] }
+    private func knownExecutables(for target: CLIDiscoveryTarget) -> [URL] {
+        if let knownExecutableOverrides { return knownExecutableOverrides[target] ?? [] }
+        guard target == .codex else { return [] }
         let appRelativePath = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
         return [URL(fileURLWithPath: "/Applications/ChatGPT.app", isDirectory: true)
                     .appendingPathComponent(appRelativePath),
                 homeDirectory.appendingPathComponent("Applications/ChatGPT.app", isDirectory: true)
                     .appendingPathComponent(appRelativePath)]
-    }
-
-    private func detectedAntigravityExecutables() -> [CLIDiscovery] {
-        var candidates = searchDirectories().map { $0.appendingPathComponent("agy", isDirectory: false) }
-        candidates.append(homeDirectory.appendingPathComponent(".local/bin/agy", isDirectory: false))
-        var seen = Set<String>()
-        return candidates.compactMap { candidate in
-            guard fileManager.isExecutableFile(atPath: candidate.path) else { return nil }
-            let resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
-            guard seen.insert(resolved.path).inserted else { return nil }
-            return CLIDiscovery(target: .antigravity,
-                                executableURL: resolved,
-                                discoveryURL: candidate.standardizedFileURL,
-                                isManaged: false)
-        }
     }
 
     private func searchDirectories() -> [URL] {
@@ -279,32 +194,5 @@ struct CLIInstallService {
         }
         var seen = Set<String>()
         return directories.filter { seen.insert($0.standardizedFileURL.path).inserted }
-    }
-
-    private func sanitizedEnvironment(npmDirectory: URL, cacheDirectory: URL, userConfig: URL) -> [String: String] {
-        let inheritedPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        var result = ["PATH": "\(npmDirectory.path):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                      "HOME": environment["HOME"] ?? NSHomeDirectory(),
-                      "npm_config_registry": "https://registry.npmjs.org/",
-                      "npm_config_cache": cacheDirectory.path,
-                      "npm_config_userconfig": userConfig.path,
-                      "npm_config_update_notifier": "false"]
-        // Add only executable search paths; never pass npm auth or arbitrary variables through.
-        for component in inheritedPath.split(separator: ":").map(String.init) {
-            if component == "/opt/homebrew/bin" || component == "/usr/local/bin" ||
-                component == "/usr/bin" || component == "/bin" || component == "/usr/sbin" || component == "/sbin" {
-                continue
-            }
-            result["PATH", default: ""] += ":\(component)"
-        }
-        return result
-    }
-
-    private func discoverExecutable(named name: String) -> URL? {
-        for directory in searchDirectories() {
-            let candidate = directory.appendingPathComponent(name, isDirectory: false)
-            if fileManager.isExecutableFile(atPath: candidate.path) { return candidate }
-        }
-        return nil
     }
 }

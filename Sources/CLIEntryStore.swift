@@ -13,8 +13,16 @@ struct CLIEntry: Codable, Equatable, Identifiable {
     var origin: CLIEntryOrigin = .manual
     var detectedPath: String? = nil
 
-    var displayName: String { "\(provider) \(ordinal)" }
-    var statusText: String { "Registro manual · CLI ainda não instalada" }
+    var displayName: String {
+        let title = CLIProvider(rawValue: provider)?.catalogTitle ??
+            (provider == "GeminiCLI" ? "GeminiCLI (legado)" : provider)
+        return "\(title) \(ordinal)"
+    }
+    var statusText: String {
+        provider == "GeminiCLI"
+            ? "Cadastro legado GeminiCLI · associação preservada"
+            : "Cadastro manual · instalação isolada ainda indisponível"
+    }
 
     private enum CodingKeys: String, CodingKey { case id, provider, ordinal, origin, detectedPath }
 
@@ -58,6 +66,7 @@ struct CLIAutomaticInstallation: Codable, Equatable, Identifiable {
 struct CLIListSnapshot: Equatable {
     let manualRegistrations: [CLIEntry]
     let detectedInstallations: [CLIAutomaticInstallation]
+    let migrationNotice: String?
 }
 
 struct CLIEntryStore {
@@ -88,6 +97,11 @@ struct CLIEntryStore {
     func snapshot(discoveries: [CLIDiscovery]) throws -> CLIListSnapshot {
         var document = try loadDocument()
         let migrated = Self.migrateLegacyAutomaticEntries(in: &document)
+        let legacyGeminiCount = document.entries.filter {
+            $0.origin == .manual && $0.provider == "GeminiCLI"
+        }.count
+        let migrationNeedsDecision = Self.migrateLegacyGeminiRegistrations(
+            in: &document, discoveries: discoveries)
         document.highestOrdinals = Self.manualHighWater(document.entries,
                                                        preserving: document.highestOrdinals)
 
@@ -107,34 +121,31 @@ struct CLIEntryStore {
         }
 
         try save(document)
+        let notice: String?
+        if migrationNeedsDecision {
+            notice = "Cadastro(s) GeminiCLI legado(s) preservado(s). Há uma CLI Gemini real ou colisão de ordinais; confirme o destino antes de migrar para Antigravity CLI."
+        } else if legacyGeminiCount > 0 {
+            notice = "Cadastro(s) do catálogo GeminiCLI migrado(s) para Antigravity CLI; IDs e ordinais foram preservados. Nenhuma instalação, configuração ou credencial foi alterada."
+        } else {
+            notice = nil
+        }
         return CLIListSnapshot(manualRegistrations: document.entries,
-                               detectedInstallations: automatic)
+                               detectedInstallations: automatic,
+                               migrationNotice: notice)
     }
 
     @discardableResult
-    func add(provider: String) throws -> [CLIEntry] {
+    func add(provider: CLIProvider) throws -> [CLIEntry] {
         var document = try loadDocument()
         _ = Self.migrateLegacyAutomaticEntries(in: &document)
         document.entries = document.entries.filter { $0.origin == .manual }
         document.highestOrdinals = Self.manualHighWater(document.entries,
                                                        preserving: document.highestOrdinals)
-        let lastOrdinal = document.highestOrdinals[provider] ?? 0
+        let lastOrdinal = document.highestOrdinals[provider.rawValue] ?? 0
         guard lastOrdinal < Int.max else { throw StoreError.invalidEntries }
         let nextOrdinal = lastOrdinal + 1
-        document.entries.append(CLIEntry(id: UUID(), provider: provider, ordinal: nextOrdinal))
-        document.highestOrdinals[provider] = nextOrdinal
-        try save(document)
-        return document.entries
-    }
-
-    /// Compatibility entry point for the pre-split UI. It now updates migration state only;
-    /// callers should use `snapshot(discoveries:)` to display automatic installations.
-    @discardableResult
-    func reconcile(discoveries: [CLIDetection]) throws -> [CLIEntry] {
-        var document = try loadDocument()
-        _ = Self.migrateLegacyAutomaticEntries(in: &document)
-        document.highestOrdinals = Self.manualHighWater(document.entries,
-                                                       preserving: document.highestOrdinals)
+        document.entries.append(CLIEntry(id: UUID(), provider: provider.rawValue, ordinal: nextOrdinal))
+        document.highestOrdinals[provider.rawValue] = nextOrdinal
         try save(document)
         return document.entries
     }
@@ -205,6 +216,37 @@ struct CLIEntryStore {
         document.entries = manual
         // Legacy suppression entries are deliberately discarded during encoding.
         return migrated
+    }
+
+    /// Converts only registrations made under the retired Gemini catalog label when a real
+    /// Gemini executable is absent and no Antigravity ordinal would collide. A real Gemini
+    /// installation or an index collision keeps every legacy row intact and asks for a decision.
+    private static func migrateLegacyGeminiRegistrations(in document: inout StoreDocument,
+                                                           discoveries: [CLIDiscovery]) -> Bool {
+        let legacyEntries = document.entries.filter {
+            $0.origin == .manual && $0.provider == "GeminiCLI"
+        }
+        guard !legacyEntries.isEmpty else { return false }
+
+        let realGeminiInstalled = discoveries.contains { $0.target == .gemini }
+        let antigravityOrdinals = Set(document.entries
+            .filter { $0.origin == .manual && $0.provider == CLIProvider.antigravity.rawValue }
+            .map(\.ordinal))
+        let hasOrdinalCollision = legacyEntries.contains { antigravityOrdinals.contains($0.ordinal) }
+        guard !realGeminiInstalled, !hasOrdinalCollision else { return true }
+
+        for index in document.entries.indices where document.entries[index].provider == "GeminiCLI"
+            && document.entries[index].origin == .manual {
+            let legacy = document.entries[index]
+            document.entries[index] = CLIEntry(id: legacy.id,
+                                                provider: CLIProvider.antigravity.rawValue,
+                                                ordinal: legacy.ordinal)
+        }
+        let oldHighWater = document.highestOrdinals["GeminiCLI"] ?? legacyEntries.map(\.ordinal).max() ?? 0
+        document.highestOrdinals[CLIProvider.antigravity.rawValue] = max(
+            document.highestOrdinals[CLIProvider.antigravity.rawValue] ?? 0,
+            oldHighWater)
+        return false
     }
 
     private static func manualHighWater(_ entries: [CLIEntry], preserving old: [String: Int]) -> [String: Int] {
